@@ -1349,6 +1349,20 @@ fn verify_reqwest(response: &reqwest::Response, options: Options) -> Result<Nego
 }
 
 fn verify(response: &Response<Incoming>, options: Options) -> Result<Negotiation> {
+    // Detect HTTP redirects before checking for 101.
+    if response.status().is_redirection() {
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        return Err(WebSocketError::Redirected {
+            status_code: response.status().as_u16(),
+            location,
+        });
+    }
+
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         return Err(WebSocketError::InvalidStatusCode(
             response.status().as_u16(),

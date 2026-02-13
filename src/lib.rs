@@ -130,6 +130,16 @@ pub enum WebSocketError {
     #[cfg(not(target_arch = "wasm32"))]
     InvalidStatusCode(u16),
 
+    /// Server responded with a redirect status code.
+    #[error("Redirected with status code {status_code} to {location}")]
+    #[cfg(not(target_arch = "wasm32"))]
+    Redirected {
+        /// The HTTP status code (e.g. 301, 302, 307, 308).
+        status_code: u16,
+        /// The target location from the `Location` header.
+        location: String,
+    },
+
     /// Missing or invalid "Upgrade: websocket" header.
     #[error("Invalid upgrade header")]
     #[cfg(not(target_arch = "wasm32"))]
@@ -247,6 +257,7 @@ impl WebSocketError {
         matches!(
             self,
             Self::InvalidStatusCode(_)
+                | Self::Redirected { .. }
                 | Self::InvalidUpgradeHeader
                 | Self::InvalidConnectionHeader
                 | Self::InvalidSecWebsocketVersion
