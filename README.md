@@ -107,7 +107,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-yawc = "0.2"
+yawc = "0.3"
 ```
 
 ### Client Example
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
 
 ```toml
 [dependencies]
-yawc = { version = "0.2" }
+yawc = { version = "0.3" }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 ```
@@ -179,7 +179,7 @@ async fn main() {
 
 ```toml
 [dependencies]
-yawc = "0.2"
+yawc = "0.3"
 futures = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 hyper = { version = "1", features = ["http1", "server"] }
@@ -250,7 +250,7 @@ To use the Axum integration, add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-yawc = { version = "0.2", features = ["axum"] }
+yawc = { version = "0.3", features = ["axum"] }
 axum = "0.7"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
