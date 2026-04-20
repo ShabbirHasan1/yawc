@@ -228,7 +228,7 @@ impl Negotiation {
             client_no_context_takeover={} server_no_context_takeover={} \
             server_max_window_bits={:?} client_max_window_bits={:?}",
             config.client_no_context_takeover,
-            config.client_no_context_takeover,
+            config.server_no_context_takeover,
             config.server_max_window_bits,
             config.client_max_window_bits
         );
@@ -272,7 +272,7 @@ impl Negotiation {
             client_no_context_takeover={} server_no_context_takeover={} \
             server_max_window_bits={:?} client_max_window_bits={:?}",
             config.client_no_context_takeover,
-            config.client_no_context_takeover,
+            config.server_no_context_takeover,
             config.server_max_window_bits,
             config.client_max_window_bits
         );
@@ -1433,12 +1433,15 @@ fn tls_connector() -> TlsConnector {
 
     #[cfg(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
     let provider = maybe_provider.unwrap_or_else(|| {
-        #[cfg(feature = "rustls-ring")]
-        let provider = rustls::crypto::ring::default_provider();
-        #[cfg(feature = "rustls-aws-lc-rs")]
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
-
-        Arc::new(provider)
+        // Use ring as default if both are enabled, user can override with custom connector
+        #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc-rs")))]
+        return Arc::new(rustls::crypto::ring::default_provider());
+        
+        #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
+        return Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        
+        #[cfg(all(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
+        return Arc::new(rustls::crypto::ring::default_provider());
     });
 
     #[cfg(not(any(feature = "rustls-ring", feature = "rustls-aws-lc-rs")))]

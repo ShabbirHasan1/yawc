@@ -57,7 +57,7 @@ pub type CompressionLevel = flate2::Compression;
 ///     .with_limits(128 * 1024, 256 * 1024)  // Small payload/buffer limits
 ///     .without_compression();                 // Avoid compression overhead
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Options {
     /// Maximum allowed payload size for incoming messages, in bytes.
     ///
@@ -603,7 +603,7 @@ impl Options {
 ///     ..Default::default()
 /// };
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DeflateOptions {
     /// Sets the compression level (0-9), balancing compression ratio against CPU usage.
     ///
