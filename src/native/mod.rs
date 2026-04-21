@@ -1436,10 +1436,10 @@ fn tls_connector() -> TlsConnector {
         // Use ring as default if both are enabled, user can override with custom connector
         #[cfg(all(feature = "rustls-ring", not(feature = "rustls-aws-lc-rs")))]
         return Arc::new(rustls::crypto::ring::default_provider());
-        
+
         #[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
         return Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        
+
         #[cfg(all(feature = "rustls-ring", feature = "rustls-aws-lc-rs"))]
         return Arc::new(rustls::crypto::ring::default_provider());
     });
