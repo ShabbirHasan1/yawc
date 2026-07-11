@@ -76,13 +76,10 @@ async fn handle_websocket(req: Request<Incoming>) -> Result<Response<Empty<Bytes
         match upgrade_fut.await {
             Ok(mut ws) => {
                 while let Some(frame) = ws.next().await {
-                    match frame.opcode() {
-                        OpCode::Text | OpCode::Binary => {
-                            if ws.send(frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => {}
+                    if matches!(frame.opcode(), OpCode::Text | OpCode::Binary)
+                        && ws.send(frame).await.is_err()
+                    {
+                        break;
                     }
                 }
             }

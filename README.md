@@ -525,6 +525,38 @@ If you specialize in performance-critical software, understand systems down to t
 
 ## Dev
 
+#### Running the checks
+
+The repository ships a [`cargo-make`](https://github.com/sagiegurari/cargo-make)
+`Makefile.toml` with the same checks CI runs. Install the runner once:
+
+```
+cargo install cargo-make
+```
+
+Then run the full pre-PR gate:
+
+```
+cargo make ci
+```
+
+This runs, in order: format check, clippy (warnings denied), build, tests
+(default and `zlib` features), doc build, wasm tests, and the autobahn client
+and server suites. The full gate needs `wasm-pack` and `deno` installed, same as
+the GitHub runner.
+
+Individual tasks are available too:
+
+```
+cargo make format          # format the code in place
+cargo make clippy          # lint with -D warnings
+cargo make test            # default-feature tests (nextest if installed)
+cargo make test-zlib       # tests with the zlib feature
+cargo make doc             # build docs, deny doc warnings
+cargo make wasm            # wasm tests (headless chrome + node)
+cargo make autobahn        # both autobahn suites
+```
+
 #### How to run autobahn tests.
 
 The tests require you to have docker started and install deno.

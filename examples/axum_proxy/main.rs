@@ -298,7 +298,7 @@ fn on_subscription(
         }
         "unsubscribe" => {
             streams.remove(&topic);
-            unsubscribe_user(&state, topic);
+            unsubscribe_user(state, topic);
         }
         _ => {}
     }
@@ -440,6 +440,8 @@ struct BybitSubscribe<'a> {
 #[derive(Deserialize)]
 struct BybitMsg<'a> {
     topic: &'a str,
+    // Present on the wire but not used by the proxy; kept to document the shape.
+    #[allow(dead_code)]
     r#type: &'a str,
 }
 
