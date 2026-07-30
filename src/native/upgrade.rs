@@ -15,7 +15,7 @@ use super::{HttpStream, Negotiation, Role, WebSocket};
 
 #[cfg(feature = "axum")]
 use {
-    super::{Options, MAX_PAYLOAD_READ, MAX_READ_BUFFER},
+    super::Options,
     crate::{compression::WebSocketExtensions, Result},
     http_body_util::Empty,
     hyper::{header, Response},
@@ -150,28 +150,9 @@ impl IncomingUpgrade {
             .body(Empty::new())
             .expect("bug: failed to build response");
 
-        // max read buffer should be at least 2 times the payload read if not specified
-        let max_read_buffer = options.max_read_buffer.unwrap_or(
-            options
-                .max_payload_read
-                .map(|payload_read| payload_read * 2)
-                .unwrap_or(MAX_READ_BUFFER),
-        );
-
         let stream = UpgradeFut {
             inner: self.on_upgrade,
-            negotiation: Some(Negotiation {
-                extensions,
-                compression_level: options
-                    .compression
-                    .as_ref()
-                    .map(|compression| compression.level),
-                max_payload_read: options.max_payload_read.unwrap_or(MAX_PAYLOAD_READ),
-                max_backpressure_write_boundary: options.max_backpressure_write_boundary,
-                fragmentation: options.fragmentation.clone(),
-                max_read_buffer,
-                utf8: options.check_utf8,
-            }),
+            negotiation: Some(Negotiation::new(extensions, &options, Role::Server)?),
         };
 
         Ok((response, stream))
