@@ -10,3 +10,10 @@ tags*
 !/benches/README.md
 !/benches/load_test.c
 !/benches/Makefile
+
+# cargo-fuzz
+fuzz/Cargo.lock
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/target/
