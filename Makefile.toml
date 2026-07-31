@@ -158,3 +158,34 @@ dependencies = [
 
 [tasks.default]
 alias = "ci"
+
+# ------------------------------------------------------------------------------
+# Fuzzing
+# ------------------------------------------------------------------------------
+#
+# Coverage-guided targets, see fuzz/README.md. These need nightly and
+# `cargo install cargo-fuzz`, so they are not part of the `ci` task. The seeded
+# `test_fuzz_*` tests in src/compression.rs cover the same properties on every run.
+#
+# `-timeout` makes libFuzzer report an input that stops making progress as a hang,
+# which is the failure mode of issue #40.
+
+[tasks.fuzz-frame]
+description = "Fuzz the frame decoder for 5 minutes"
+command = "cargo"
+args = [
+    "+nightly", "fuzz", "run", "frame_decode", "--fuzz-dir", "fuzz", "--",
+    "-max_total_time=300", "-timeout=15",
+]
+
+[tasks.fuzz-websocket]
+description = "Fuzz the websocket read path for 5 minutes"
+command = "cargo"
+args = [
+    "+nightly", "fuzz", "run", "websocket_read", "--fuzz-dir", "fuzz", "--",
+    "-max_total_time=300", "-timeout=15",
+]
+
+[tasks.fuzz]
+description = "Run all fuzz targets"
+dependencies = ["fuzz-frame", "fuzz-websocket"]

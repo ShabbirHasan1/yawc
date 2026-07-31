@@ -145,7 +145,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use codec::Codec;
-use compression::{Compressor, Decompressor, WebSocketExtensions};
+use compression::{CompressionConfig, Compressor, Decompressor, WebSocketExtensions};
 use futures::{task::AtomicWaker, SinkExt};
 use tokio_rustls::rustls::{self, pki_types::TrustAnchor};
 use tokio_util::codec::Framed;
@@ -210,8 +210,7 @@ pub type UpgradeResult = Result<(HttpResponse, UpgradeFut)>;
 /// Parameters negotiated with the client or the server.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Negotiation {
-    pub(crate) extensions: Option<WebSocketExtensions>,
-    pub(crate) compression_level: Option<CompressionLevel>,
+    pub(crate) compression: Option<CompressionConfig>,
     pub(crate) max_payload_read: usize,
     pub(crate) max_read_buffer: usize,
     pub(crate) utf8: bool,
@@ -220,94 +219,54 @@ pub(crate) struct Negotiation {
 }
 
 impl Negotiation {
-    pub(crate) fn decompressor(&self, role: Role) -> Option<Decompressor> {
-        let config = self.extensions.as_ref()?;
+    /// Resolves the negotiated extensions and the local options into the settings a
+    /// connection runs with.
+    ///
+    /// Every handshake path goes through here, so the mapping from [`Options`] lives in
+    /// one place.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the peer negotiated permessage-deflate but this side never
+    /// offered it. See [`CompressionConfig::resolve`].
+    pub(crate) fn new(
+        extensions: Option<WebSocketExtensions>,
+        options: &Options,
+        role: Role,
+    ) -> Result<Self> {
+        let compression = CompressionConfig::resolve(
+            extensions.as_ref(),
+            options.compression.as_ref().map(|deflate| deflate.level),
+            role,
+        )?;
 
-        log::debug!(
-            "Established decompressor for {role} with settings \
-            client_no_context_takeover={} server_no_context_takeover={} \
-            server_max_window_bits={:?} client_max_window_bits={:?}",
-            config.client_no_context_takeover,
-            config.server_no_context_takeover,
-            config.server_max_window_bits,
-            config.client_max_window_bits
+        // The read buffer holds at least two payloads unless told otherwise.
+        let max_payload_read = options.max_payload_read.unwrap_or(MAX_PAYLOAD_READ);
+        let max_read_buffer = options.max_read_buffer.unwrap_or(
+            options
+                .max_payload_read
+                .map(|payload_read| payload_read * 2)
+                .unwrap_or(MAX_READ_BUFFER),
         );
 
-        // configure the decompressor using the assigned role and preferred flags.
-        Some(if role == Role::Server {
-            if config.client_no_context_takeover {
-                Decompressor::no_context_takeover()
-            } else {
-                #[cfg(feature = "zlib")]
-                if let Some(Some(window_bits)) = config.client_max_window_bits {
-                    Decompressor::new_with_window_bits(window_bits.max(9))
-                } else {
-                    Decompressor::new()
-                }
-                #[cfg(not(feature = "zlib"))]
-                Decompressor::new()
-            }
-        } else {
-            // client
-            if config.server_no_context_takeover {
-                Decompressor::no_context_takeover()
-            } else {
-                #[cfg(feature = "zlib")]
-                if let Some(Some(window_bits)) = config.server_max_window_bits {
-                    Decompressor::new_with_window_bits(window_bits)
-                } else {
-                    Decompressor::new()
-                }
-                #[cfg(not(feature = "zlib"))]
-                Decompressor::new()
-            }
+        Ok(Self {
+            compression,
+            max_payload_read,
+            max_read_buffer,
+            utf8: options.check_utf8,
+            fragmentation: options.fragmentation.clone(),
+            max_backpressure_write_boundary: options.max_backpressure_write_boundary,
         })
     }
 
-    pub(crate) fn compressor(&self, role: Role) -> Option<Compressor> {
-        let config = self.extensions.as_ref()?;
+    pub(crate) fn compressor(&self) -> Option<Compressor> {
+        self.compression.as_ref().map(CompressionConfig::compressor)
+    }
 
-        log::debug!(
-            "Established compressor for {role} with settings \
-            client_no_context_takeover={} server_no_context_takeover={} \
-            server_max_window_bits={:?} client_max_window_bits={:?}",
-            config.client_no_context_takeover,
-            config.server_no_context_takeover,
-            config.server_max_window_bits,
-            config.client_max_window_bits
-        );
-
-        let level = self.compression_level.unwrap();
-
-        // configure the compressor using the assigned role and preferred flags.
-        Some(if role == Role::Client {
-            if config.client_no_context_takeover {
-                Compressor::no_context_takeover(level)
-            } else {
-                #[cfg(feature = "zlib")]
-                if let Some(Some(window_bits)) = config.client_max_window_bits {
-                    Compressor::new_with_window_bits(level, window_bits)
-                } else {
-                    Compressor::new(level)
-                }
-                #[cfg(not(feature = "zlib"))]
-                Compressor::new(level)
-            }
-        } else {
-            // server
-            if config.server_no_context_takeover {
-                Compressor::no_context_takeover(level)
-            } else {
-                #[cfg(feature = "zlib")]
-                if let Some(Some(window_bits)) = config.server_max_window_bits {
-                    Compressor::new_with_window_bits(level, window_bits)
-                } else {
-                    Compressor::new(level)
-                }
-                #[cfg(not(feature = "zlib"))]
-                Compressor::new(level)
-            }
-        })
+    pub(crate) fn decompressor(&self) -> Option<Decompressor> {
+        self.compression
+            .as_ref()
+            .map(CompressionConfig::decompressor)
     }
 }
 
@@ -1100,27 +1059,9 @@ impl WebSocket<HttpStream> {
             None
         };
 
-        let max_read_buffer = options.max_read_buffer.unwrap_or(
-            options
-                .max_payload_read
-                .map(|payload_read| payload_read * 2)
-                .unwrap_or(MAX_READ_BUFFER),
-        );
-
         let stream = UpgradeFut {
             inner: hyper::upgrade::on(request),
-            negotiation: Some(Negotiation {
-                extensions,
-                compression_level: options
-                    .compression
-                    .as_ref()
-                    .map(|compression| compression.level),
-                max_payload_read: options.max_payload_read.unwrap_or(MAX_PAYLOAD_READ),
-                max_read_buffer,
-                utf8: options.check_utf8,
-                fragmentation: options.fragmentation.clone(),
-                max_backpressure_write_boundary: options.max_backpressure_write_boundary,
-            }),
+            negotiation: Some(Negotiation::new(extensions, &options, Role::Server)?),
         };
 
         Ok((response, stream))
@@ -1303,7 +1244,6 @@ fn verify_reqwest(response: &reqwest::Response, options: Options) -> Result<Nego
         ));
     }
 
-    let compression_level = options.compression.as_ref().map(|opts| opts.level);
     let headers = response.headers();
 
     if !headers
@@ -1330,22 +1270,7 @@ fn verify_reqwest(response: &reqwest::Response, options: Options) -> Result<Nego
         .map(WebSocketExtensions::from_str)
         .and_then(std::result::Result::ok);
 
-    let max_read_buffer = options.max_read_buffer.unwrap_or(
-        options
-            .max_payload_read
-            .map(|payload_read| payload_read * 2)
-            .unwrap_or(MAX_READ_BUFFER),
-    );
-
-    Ok(Negotiation {
-        extensions,
-        compression_level,
-        max_payload_read: options.max_payload_read.unwrap_or(MAX_PAYLOAD_READ),
-        max_read_buffer,
-        utf8: options.check_utf8,
-        fragmentation: options.fragmentation.clone(),
-        max_backpressure_write_boundary: options.max_backpressure_write_boundary,
-    })
+    Negotiation::new(extensions, &options, Role::Client)
 }
 
 fn verify(response: &Response<Incoming>, options: Options) -> Result<Negotiation> {
@@ -1369,7 +1294,6 @@ fn verify(response: &Response<Incoming>, options: Options) -> Result<Negotiation
         ));
     }
 
-    let compression_level = options.compression.as_ref().map(|opts| opts.level);
     let headers = response.headers();
 
     if !headers
@@ -1396,22 +1320,7 @@ fn verify(response: &Response<Incoming>, options: Options) -> Result<Negotiation
         .map(WebSocketExtensions::from_str)
         .and_then(std::result::Result::ok);
 
-    let max_read_buffer = options.max_read_buffer.unwrap_or(
-        options
-            .max_payload_read
-            .map(|payload_read| payload_read * 2)
-            .unwrap_or(MAX_READ_BUFFER),
-    );
-
-    Ok(Negotiation {
-        extensions,
-        compression_level,
-        max_payload_read: options.max_payload_read.unwrap_or(MAX_PAYLOAD_READ),
-        max_read_buffer,
-        utf8: options.check_utf8,
-        fragmentation: options.fragmentation.clone(),
-        max_backpressure_write_boundary: options.max_backpressure_write_boundary,
-    })
+    Negotiation::new(extensions, &options, Role::Client)
 }
 
 fn generate_key() -> String {
@@ -1526,34 +1435,32 @@ mod tests {
     ) -> (WebSocket<MockStream>, WebSocket<MockStream>) {
         let (client_stream, server_stream) = MockStream::pair(buffer_size);
 
-        let extensions = compression_level.map(|_level| WebSocketExtensions {
-            server_max_window_bits: None,
-            client_max_window_bits: None,
-            server_no_context_takeover: false,
-            client_no_context_takeover: false,
-        });
+        let extensions = compression_level.map(|_level| WebSocketExtensions::default());
 
-        let negotiation = Negotiation {
-            extensions,
-            compression_level,
-            max_payload_read: MAX_PAYLOAD_READ,
-            max_read_buffer: MAX_READ_BUFFER,
-            utf8: false,
-            fragmentation: fragment_size.map(|size| options::Fragmentation {
-                timeout: None,
-                fragment_size: Some(size),
-            }),
-            max_backpressure_write_boundary: None,
-        };
+        let mut options = Options::default();
+        if let Some(level) = compression_level {
+            options = options.with_compression_level(level);
+        }
+        if let Some(size) = fragment_size {
+            options = options.with_max_fragment_size(size);
+        }
+
+        let negotiation =
+            |role| Negotiation::new(extensions.clone(), &options, role).expect("negotiation");
 
         let client_ws = WebSocket::new(
             Role::Client,
             client_stream,
             Bytes::new(),
-            negotiation.clone(),
+            negotiation(Role::Client),
         );
 
-        let server_ws = WebSocket::new(Role::Server, server_stream, Bytes::new(), negotiation);
+        let server_ws = WebSocket::new(
+            Role::Server,
+            server_stream,
+            Bytes::new(),
+            negotiation(Role::Server),
+        );
 
         (client_ws, server_ws)
     }
@@ -1977,27 +1884,22 @@ mod tests {
         // Create WebSocket pair with fragment_size set to 100 bytes
         let (client_stream, server_stream) = MockStream::pair(8192);
 
-        let negotiation = Negotiation {
-            extensions: None,
-            compression_level: None,
-            max_payload_read: MAX_PAYLOAD_READ,
-            max_read_buffer: MAX_READ_BUFFER,
-            utf8: false,
-            fragmentation: Some(options::Fragmentation {
-                timeout: None,
-                fragment_size: Some(100),
-            }),
-            max_backpressure_write_boundary: None,
-        };
+        let options = Options::default().with_max_fragment_size(100);
+        let negotiation = |role| Negotiation::new(None, &options, role).expect("negotiation");
 
         let mut client_ws = WebSocket::new(
             Role::Client,
             client_stream,
             Bytes::new(),
-            negotiation.clone(),
+            negotiation(Role::Client),
         );
 
-        let mut server_ws = WebSocket::new(Role::Server, server_stream, Bytes::new(), negotiation);
+        let mut server_ws = WebSocket::new(
+            Role::Server,
+            server_stream,
+            Bytes::new(),
+            negotiation(Role::Server),
+        );
 
         // Send a large message (300 bytes) from client
         let large_payload = vec![b'A'; 300];
@@ -2017,27 +1919,22 @@ mod tests {
         // Create WebSocket pair with fragment_size set to 100 bytes
         let (client_stream, server_stream) = MockStream::pair(8192);
 
-        let negotiation = Negotiation {
-            extensions: None,
-            compression_level: None,
-            max_payload_read: MAX_PAYLOAD_READ,
-            max_read_buffer: MAX_READ_BUFFER,
-            utf8: false,
-            fragmentation: Some(options::Fragmentation {
-                timeout: None,
-                fragment_size: Some(100),
-            }),
-            max_backpressure_write_boundary: None,
-        };
+        let options = Options::default().with_max_fragment_size(100);
+        let negotiation = |role| Negotiation::new(None, &options, role).expect("negotiation");
 
         let mut client_ws = WebSocket::new(
             Role::Client,
             client_stream,
             Bytes::new(),
-            negotiation.clone(),
+            negotiation(Role::Client),
         );
 
-        let mut server_ws = WebSocket::new(Role::Server, server_stream, Bytes::new(), negotiation);
+        let mut server_ws = WebSocket::new(
+            Role::Server,
+            server_stream,
+            Bytes::new(),
+            negotiation(Role::Server),
+        );
 
         // Send a small message (50 bytes) from client
         let small_payload = vec![b'B'; 50];
@@ -2057,24 +1954,22 @@ mod tests {
         // Create WebSocket pair WITHOUT fragment_size
         let (client_stream, server_stream) = MockStream::pair(8192);
 
-        let negotiation = Negotiation {
-            extensions: None,
-            compression_level: None,
-            max_payload_read: MAX_PAYLOAD_READ,
-            max_read_buffer: MAX_READ_BUFFER,
-            utf8: false,
-            fragmentation: None,
-            max_backpressure_write_boundary: None,
-        };
+        let options = Options::default();
+        let negotiation = |role| Negotiation::new(None, &options, role).expect("negotiation");
 
         let mut client_ws = WebSocket::new(
             Role::Client,
             client_stream,
             Bytes::new(),
-            negotiation.clone(),
+            negotiation(Role::Client),
         );
 
-        let mut server_ws = WebSocket::new(Role::Server, server_stream, Bytes::new(), negotiation);
+        let mut server_ws = WebSocket::new(
+            Role::Server,
+            server_stream,
+            Bytes::new(),
+            negotiation(Role::Server),
+        );
 
         // Send a large message (1000 bytes) without fragmentation config
         let large_payload = vec![b'C'; 1000];
@@ -2318,6 +2213,132 @@ mod tests {
         assert_eq!(
             received, original_payload,
             "Compressed fragmented payload mismatch"
+        );
+    }
+
+    /// A client that terminates its deflate stream with a final block (BFINAL=1) used to
+    /// spin the server's read task at 100% CPU instead of yielding the message.
+    ///
+    /// The read runs on a detached thread with its own runtime: the spin never yields, so
+    /// it can neither be cancelled from within its own task nor joined at runtime
+    /// shutdown. Going through a channel lets a regression fail on the timeout instead of
+    /// hanging the whole test run.
+    ///
+    /// See https://github.com/infinitefield/yawc/issues/40
+    #[test]
+    fn test_final_block_compressed_frame_does_not_spin() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        const TEXT: &str = r#"[2,"35364f26","TransactionEvent",{"eventType":"Started"}]"#;
+
+        for client_no_context_takeover in [false, true] {
+            let extensions = WebSocketExtensions {
+                client_no_context_takeover,
+                ..Default::default()
+            };
+            let options = Options::default()
+                .with_compression_level(CompressionLevel::default())
+                .with_utf8();
+            let negotiation =
+                Negotiation::new(Some(extensions), &options, Role::Server).expect("negotiation");
+
+            let (mut raw_client, server_stream) = MockStream::pair(4096);
+            let mut server = WebSocket::new(Role::Server, server_stream, Bytes::new(), negotiation);
+
+            // Compress the way the reporter's client does: finish the deflate stream
+            // (BFINAL=1) and leave trailing bytes the inflater can never consume.
+            let mut encoder = flate2::Compress::new(flate2::Compression::default(), false);
+            let mut payload = vec![0u8; 512];
+            encoder
+                .compress(TEXT.as_bytes(), &mut payload, flate2::FlushCompress::Finish)
+                .expect("compression failed");
+            payload.truncate(encoder.total_out() as usize);
+            payload.extend_from_slice(&[0x0b, 0x5b, 0xb9, 0x68]);
+            assert!(payload.len() < 126, "frame length must fit the 7-bit form");
+
+            // FIN + RSV1 + Text, masked as a client frame.
+            let mask = [0xa1, 0x15, 0x93, 0xf5];
+            let mut bytes = vec![0xc1, 0x80 | payload.len() as u8];
+            bytes.extend_from_slice(&mask);
+            bytes.extend(
+                payload
+                    .iter()
+                    .enumerate()
+                    .map(|(i, byte)| byte ^ mask[i % 4]),
+            );
+
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+
+                let result = runtime.block_on(async move {
+                    raw_client.write_all(&bytes).await.expect("write frame");
+                    raw_client.flush().await.expect("flush frame");
+
+                    let frame = server.next_frame().await?;
+                    Ok::<_, WebSocketError>((frame.opcode(), frame.payload().to_vec()))
+                });
+
+                let _ = tx.send(result);
+            });
+
+            let (opcode, payload) = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("server read spun instead of returning (issue #40)")
+                .expect("failed to receive frame");
+
+            assert_eq!(opcode, OpCode::Text);
+            assert_eq!(payload, TEXT.as_bytes());
+        }
+    }
+
+    /// A server must not be able to switch compression on for a client that never
+    /// offered it. This reached an unwrap and panicked the client task before the
+    /// negotiation was resolved in one place.
+    ///
+    /// RFC 6455, Section 4.1: a client must fail the connection when the response
+    /// indicates an extension that was not present in its handshake.
+    #[tokio::test]
+    async fn test_unoffered_compression_fails_handshake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const HANDSHAKE: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\n\
+            upgrade: websocket\r\n\
+            connection: upgrade\r\n\
+            sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+            sec-websocket-extensions: permessage-deflate\r\n\
+            \r\n";
+
+        let (client_io, mut peer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                match peer.read(&mut byte).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => request.push(byte[0]),
+                }
+            }
+            let _ = peer.write_all(HANDSHAKE).await;
+            // Hold the connection open so the failure comes from the negotiation.
+            std::future::pending::<()>().await;
+        });
+
+        // Compression is not enabled on this side.
+        let options = Options::default();
+        assert!(options.compression.is_none());
+
+        let result =
+            WebSocket::handshake("ws://localhost/".parse().expect("url"), client_io, options).await;
+
+        assert!(
+            matches!(result, Err(WebSocketError::CompressionNotSupported)),
+            "expected the handshake to fail, got a different outcome"
         );
     }
 }

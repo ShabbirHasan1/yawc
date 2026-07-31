@@ -188,8 +188,8 @@ where
             wake_proxy: Arc::new(WakeProxy::default()),
             obligated_sends: VecDeque::new(),
             flush_sends: false,
-            deflate: negotiated.compressor(role),
-            inflate: negotiated.decompressor(role),
+            deflate: negotiated.compressor(),
+            inflate: negotiated.decompressor(),
         }
     }
 
