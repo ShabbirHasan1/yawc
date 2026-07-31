@@ -114,6 +114,8 @@
 //! - Streaming compression is needed for real-time data
 
 mod builder;
+#[cfg(feature = "http2")]
+pub mod http2;
 mod options;
 mod split;
 pub mod streaming;
@@ -153,6 +155,8 @@ use url::Url;
 
 // Re-exports
 pub use crate::stream::MaybeTlsStream;
+#[cfg(feature = "http2")]
+pub use builder::{Http2WebSocketBuilder, HttpVersion};
 pub use builder::{HttpRequest, HttpRequestBuilder, WebSocketBuilder};
 pub use frame::{Frame, OpCode};
 pub use options::{CompressionLevel, DeflateOptions, Fragmentation, Options};
@@ -1004,11 +1008,23 @@ impl WebSocket<HttpStream> {
     }
 
     /// Attempts to upgrade an incoming `hyper::Request` to a WebSocket connection with customizable options.
+    ///
+    /// Handles both the HTTP/1.1 `Upgrade` handshake and, with the `http2` feature, the
+    /// RFC 8441 extended CONNECT handshake. The protocol is picked from the request, so
+    /// the same handler serves both.
+    ///
+    /// Accepting extended CONNECT also requires calling `enable_connect_protocol()` on
+    /// the hyper HTTP/2 server builder. Without it hyper never delivers the request.
     pub fn upgrade_with_options<B>(
         mut request: impl BorrowMut<Request<B>>,
         options: Options,
     ) -> UpgradeResult {
         let request = request.borrow_mut();
+
+        #[cfg(feature = "http2")]
+        if http2::is_extended_connect(request) {
+            return http2::upgrade(request, options);
+        }
 
         let key = request
             .headers()
@@ -1129,6 +1145,79 @@ where
     /// Asynchronously retrieves the next frame from the WebSocket stream.
     pub async fn next_frame(&mut self) -> Result<Frame> {
         poll_fn(|cx| self.poll_next_frame(cx)).await
+    }
+
+    /// Wraps a stream that has already completed a WebSocket handshake.
+    ///
+    /// Use this when something else performed the handshake and handed back a byte
+    /// stream carrying WebSocket frames: a transport yawc does not implement, a custom
+    /// HTTP client, or a proxy that has already switched protocols.
+    ///
+    /// No handshake is performed and no headers are inspected. The caller is responsible
+    /// for having negotiated a compatible connection. `role` decides whether outgoing
+    /// frames are masked ([`Role::Client`]) or not ([`Role::Server`]); getting it wrong
+    /// produces frames the peer will reject.
+    ///
+    /// If the handshake negotiated `permessage-deflate`, use
+    /// [`WebSocket::from_stream_with_extensions`] instead so the compression context is
+    /// set up with the agreed parameters.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use yawc::{Options, Role, WebSocket};
+    ///
+    /// # async fn example(io: tokio::net::TcpStream) -> yawc::Result<()> {
+    /// // `io` already carries WebSocket frames.
+    /// let ws = WebSocket::from_stream(io, Role::Client, Options::default())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_stream(io: S, role: Role, options: Options) -> Result<Self> {
+        Self::from_stream_with_extensions(io, role, None, options)
+    }
+
+    /// Wraps an already-handshaked stream, honoring the extensions the peer agreed to.
+    ///
+    /// `extensions` is the raw `Sec-WebSocket-Extensions` header value as agreed by both
+    /// sides, or `None` if no extensions were negotiated. Passing the value the handshake
+    /// settled on matters because permessage-deflate parameters such as
+    /// `server_max_window_bits` must match what the peer is using.
+    ///
+    /// See [`WebSocket::from_stream`] for the general contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `extensions` names permessage-deflate but `options` did not
+    /// enable compression, since there is no way to decode what the peer will send.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use yawc::{Options, Role, WebSocket};
+    ///
+    /// # async fn example(io: tokio::net::TcpStream) -> yawc::Result<()> {
+    /// let ws = WebSocket::from_stream_with_extensions(
+    ///     io,
+    ///     Role::Client,
+    ///     Some("permessage-deflate; client_max_window_bits=15"),
+    ///     Options::default().with_balanced_compression(),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_stream_with_extensions(
+        io: S,
+        role: Role,
+        extensions: Option<&str>,
+        options: Options,
+    ) -> Result<Self> {
+        let extensions = extensions
+            .map(WebSocketExtensions::from_str)
+            .and_then(std::result::Result::ok);
+
+        let negotiation = Negotiation::new(extensions, &options, role)?;
+        Ok(Self::new(role, io, Bytes::new(), negotiation))
     }
 
     /// Creates a new WebSocket from an existing stream.
@@ -1329,8 +1418,152 @@ fn generate_key() -> String {
     BASE64_STANDARD.encode(input)
 }
 
+/// Connects and handshakes using the HTTP version selected on the builder.
+///
+/// Unlike [`WebSocket::connect_priv`] this always resolves to an [`HttpWebSocket`],
+/// because an HTTP/2 WebSocket is one stream of a multiplexed connection and there is no
+/// socket to hand back. Keeping the return type the same for both versions is what lets
+/// [`HttpVersion::Auto`] decide at runtime.
+#[cfg(feature = "http2")]
+async fn connect_versioned(
+    url: Url,
+    tcp_address: Option<SocketAddr>,
+    connector: Option<TlsConnector>,
+    options: Options,
+    builder: HttpRequestBuilder,
+    version: HttpVersion,
+) -> Result<HttpWebSocket> {
+    let host = url.host().expect("hostname").to_string();
+
+    let tcp_stream = if let Some(tcp_address) = tcp_address {
+        TcpStream::connect(tcp_address).await?
+    } else {
+        let port = url.port_or_known_default().expect("port");
+        TcpStream::connect(format!("{host}:{port}")).await?
+    };
+
+    let _ = tcp_stream.set_nodelay(options.no_delay);
+
+    // Over plaintext there is no ALPN to consult, so the version has to be assumed:
+    // HTTP/2 means prior knowledge, anything else means HTTP/1.1.
+    let (stream, use_http2) = match url.scheme() {
+        "ws" => (
+            MaybeTlsStream::Plain(tcp_stream),
+            version == HttpVersion::Http2,
+        ),
+        "wss" => {
+            let connector = connector.unwrap_or_else(|| tls_connector_with_alpn(alpn_for(version)));
+            let domain = ServerName::try_from(host)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
+
+            let tls_stream = connector.connect(domain, tcp_stream).await?;
+            let negotiated_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+
+            // A custom connector may not offer h2 at all, so an explicit Http2 request is
+            // honored even when ALPN stayed silent. Auto follows what the server picked.
+            let use_http2 = match version {
+                HttpVersion::Http1 => false,
+                HttpVersion::Http2 => true,
+                HttpVersion::Auto => negotiated_h2,
+            };
+
+            (MaybeTlsStream::Tls(tls_stream), use_http2)
+        }
+        _ => return Err(WebSocketError::InvalidHttpScheme),
+    };
+
+    if use_http2 {
+        http2::handshake(url, stream, options, builder).await
+    } else {
+        handshake_http1_upgraded(url, stream, options, builder).await
+    }
+}
+
+/// Runs the HTTP/1.1 handshake but keeps hyper's upgraded stream instead of downcasting.
+///
+/// [`WebSocket::handshake_with_request`] recovers the original stream type so callers get
+/// their socket back. The versioned path cannot do that, since it has to produce the same
+/// type whichever HTTP version the handshake settles on.
+#[cfg(feature = "http2")]
+async fn handshake_http1_upgraded<S>(
+    url: Url,
+    io: S,
+    options: Options,
+    builder: HttpRequestBuilder,
+) -> Result<HttpWebSocket>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let mut builder = builder;
+    if !builder
+        .headers_ref()
+        .expect("header")
+        .contains_key(header::HOST)
+    {
+        let host = url.host().expect("hostname").to_string();
+        let host_header = if url.port().is_some() {
+            format!("{host}:{}", url.port_or_known_default().expect("port"))
+        } else {
+            host
+        };
+        builder = builder.header(header::HOST, host_header.as_str());
+    }
+
+    let mut req = builder
+        .method("GET")
+        .uri(&url[url::Position::BeforePath..])
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "upgrade")
+        .header(header::SEC_WEBSOCKET_KEY, generate_key())
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .body(Empty::<Bytes>::new())
+        .expect("request build");
+
+    if let Some(compression) = options.compression.as_ref() {
+        let extensions = WebSocketExtensions::from(compression);
+        let header_value = extensions.to_string().parse().expect("extensions header");
+        req.headers_mut()
+            .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
+    }
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+
+    tokio::spawn(async move {
+        if let Err(err) = conn.with_upgrades().await {
+            log::debug!("http1 connection closed: {err:?}");
+        }
+    });
+
+    let mut response = sender.send_request(req).await?;
+    let negotiated = verify(&response, options)?;
+
+    let upgraded = hyper::upgrade::on(&mut response).await?;
+
+    Ok(WebSocket::new(
+        Role::Client,
+        HttpStream::from(TokioIo::new(upgraded)),
+        Bytes::new(),
+        negotiated,
+    ))
+}
+
+/// Returns the ALPN protocols to offer for a given HTTP version preference.
+#[cfg(feature = "http2")]
+fn alpn_for(version: HttpVersion) -> Vec<Vec<u8>> {
+    match version {
+        HttpVersion::Http1 => vec![b"http/1.1".to_vec()],
+        HttpVersion::Http2 => vec![b"h2".to_vec()],
+        HttpVersion::Auto => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    }
+}
+
 /// Creates a TLS connector with root certificates for secure WebSocket connections.
 fn tls_connector() -> TlsConnector {
+    tls_connector_with_alpn(vec![b"http/1.1".to_vec()])
+}
+
+/// Creates a TLS connector offering the given ALPN protocols.
+fn tls_connector_with_alpn(alpn_protocols: Vec<Vec<u8>>) -> TlsConnector {
     let mut root_cert_store = rustls::RootCertStore::empty();
     root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| TrustAnchor {
         subject: ta.subject.clone(),
@@ -1367,7 +1600,7 @@ Either:
         .expect("versions")
         .with_root_certificates(root_cert_store)
         .with_no_client_auth();
-    config.alpn_protocols = vec!["http/1.1".into()];
+    config.alpn_protocols = alpn_protocols;
 
     TlsConnector::from(Arc::new(config))
 }

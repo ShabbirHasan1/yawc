@@ -68,9 +68,10 @@ use {
 #[cfg_attr(docsrs, doc(cfg(feature = "axum")))]
 #[cfg(feature = "axum")]
 pub struct IncomingUpgrade {
-    /// The Sec-WebSocket-Key header value from the client. This value is used for the WebSocket
-    /// handshake as required by RFC 6455.
-    key: String,
+    /// The pre-computed `Sec-WebSocket-Accept` value derived from the client's
+    /// `Sec-WebSocket-Key`. `None` for RFC 8441 extended CONNECT requests, which carry no
+    /// key and are answered with `200` rather than `101`.
+    key: Option<String>,
 
     /// The Hyper upgrade future used to complete the protocol switch from HTTP to WebSocket.
     /// This handles the low-level protocol transition after handshake is complete.
@@ -131,11 +132,16 @@ impl IncomingUpgrade {
     /// - Per-message compression parameters are synchronized
     /// - Compression context is initialized after upgrade
     pub fn upgrade(self, options: Options) -> Result<(Response<Empty<Bytes>>, UpgradeFut)> {
-        let builder = Response::builder()
-            .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
-            .header(header::CONNECTION, "upgrade")
-            .header(header::UPGRADE, "websocket")
-            .header(header::SEC_WEBSOCKET_ACCEPT, self.key);
+        // RFC 8441 answers 200 with no Upgrade, Connection or Accept headers; RFC 6455
+        // answers 101 with all three.
+        let builder = match self.key {
+            Some(key) => Response::builder()
+                .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
+                .header(header::CONNECTION, "upgrade")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_ACCEPT, key),
+            None => Response::builder().status(hyper::StatusCode::OK),
+        };
 
         let (builder, extensions) = match (self.extensions, options.compression.as_ref()) {
             (Some(client_offer), Some(server_offer)) => {
@@ -206,10 +212,22 @@ where
         use std::str::FromStr;
 
         async move {
-            let key = parts
-                .headers
-                .get(header::SEC_WEBSOCKET_KEY)
-                .ok_or(http::StatusCode::BAD_REQUEST)?;
+            // RFC 8441 drops the key exchange, so only the HTTP/1.1 handshake requires one.
+            #[cfg(feature = "http2")]
+            let is_extended_connect =
+                super::http2::is_websocket_connect(&parts.method, &parts.extensions);
+            #[cfg(not(feature = "http2"))]
+            let is_extended_connect = false;
+
+            let key = if is_extended_connect {
+                None
+            } else {
+                let key = parts
+                    .headers
+                    .get(header::SEC_WEBSOCKET_KEY)
+                    .ok_or(http::StatusCode::BAD_REQUEST)?;
+                Some(sec_websocket_protocol(key.as_bytes()))
+            };
 
             if parts
                 .headers
@@ -235,7 +253,7 @@ where
             Ok(Self {
                 on_upgrade,
                 extensions,
-                key: sec_websocket_protocol(key.as_bytes()),
+                key,
             })
         }
     }

@@ -45,6 +45,7 @@ yawc stands apart as the **most flexible and feature-complete WebSocket library*
 - **Flow Control**: Configurable backpressure boundaries and automatic fragmentation for large messages
 - **Autobahn Test Suite**: Passes all test cases for both client and server modes
 - **WebAssembly Support**: Works seamlessly in WASM environments for browser-based applications (both text and binary modes supported)
+- **HTTP/2 (RFC 8441)**: Optional extended CONNECT handshake for client and server, behind the `http2` feature
 
 ## About compression
 
@@ -201,6 +202,7 @@ These examples serve as practical reference implementations for common WebSocket
 
 - `reqwest`: Use reqwest as the HTTP client
 - `axum`: Enable integration with the Axum web framework
+- `http2`: Enable WebSockets over HTTP/2 via extended CONNECT (RFC 8441)
 - `logging`: Enable debug logging for connection events
 - `zlib`: Enable advanced compression options with zlib (not recommended unless you know what you are doing). Without this option, yawc will use miniz_oxide, a Rust deflate implementation.
 - `rustls-ring`: Enable the fallback rustls crypto provider based on `ring`

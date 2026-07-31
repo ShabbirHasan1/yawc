@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### WebSockets over HTTP/2 (RFC 8441)
+
+- **New `http2` feature**: Carries WebSocket connections over a single HTTP/2 stream
+  using extended CONNECT instead of the HTTP/1.1 `Upgrade` handshake. Only the handshake
+  changes; framing, masking and permessage-deflate are unchanged.
+  - Client: `WebSocket::connect(url).http_version(HttpVersion::Http2 | Auto | Http1)`.
+    `Auto` negotiates over ALPN and falls back to HTTP/1.1.
+  - Server: `WebSocket::upgrade` and `WebSocket::upgrade_with_options` detect extended
+    CONNECT and take the HTTP/2 path, so one handler serves both versions. The hyper
+    HTTP/2 server builder must have `enable_connect_protocol()` set.
+  - The axum `IncomingUpgrade` extractor accepts both handshakes.
+  - New errors `ExtendedConnectNotSupported` and `MissingConnectProtocol`.
+  - See the `http2_client` and `http2_server` examples.
+
+- **New `WebSocket::from_stream` and `WebSocket::from_stream_with_extensions`**: Wrap a
+  stream that has already completed a handshake elsewhere. Available regardless of
+  feature flags.
+
 #### Streaming API
 
 - **New `Streaming` type**: Low-level WebSocket API with manual fragment control

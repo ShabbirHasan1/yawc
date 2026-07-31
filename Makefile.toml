@@ -97,6 +97,13 @@ else
 fi
 '''
 
+[tasks.test-http2]
+description = "Run the test suite with the http2 feature (nextest if available)"
+# Doc tests run in `test` above. This adds the RFC 8441 unit and integration
+# tests, which are compiled out without the feature.
+env = { "YAWC_TEST_FEATURES" = "--features http2", "YAWC_TEST_DOC" = "0" }
+run_task = "test-runner"
+
 [tasks.wasm]
 description = "Run the wasm tests in headless chrome and node"
 script_runner = "@shell"
@@ -150,6 +157,7 @@ dependencies = [
     "build",
     "test",
     "test-zlib",
+    "test-http2",
     "doc",
     "wasm",
     "autobahn-client",

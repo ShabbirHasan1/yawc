@@ -6,6 +6,7 @@
 //! # Features
 //! - `reqwest`: WebSocket via reqwest HTTP client
 //! - `axum`: WebSocket extractor for axum
+//! - `http2`: WebSockets over HTTP/2 via extended CONNECT (RFC 8441)
 //! - `zlib`: Advanced compression with window size control
 //! - `json`: JSON serialization support
 //!
@@ -70,6 +71,30 @@
 //!     Ok(response)
 //! }
 //! ```
+//!
+//! # WebSockets over HTTP/2
+//!
+//! With the `http2` feature, connections can be carried over a single HTTP/2 stream using
+//! the RFC 8441 extended CONNECT handshake instead of the HTTP/1.1 `Upgrade` handshake.
+//! Only the handshake changes: framing, masking and `permessage-deflate` are the same.
+//!
+//! On the client, pick the version on the builder:
+//!
+//! ```no_run
+//! # #[cfg(feature = "http2")]
+//! async fn connect() -> yawc::Result<()> {
+//!     use yawc::{HttpVersion, WebSocket};
+//!
+//!     let ws = WebSocket::connect("wss://example.com/chat".parse()?)
+//!         .http_version(HttpVersion::Auto)
+//!         .await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! On the server, [`WebSocket::upgrade`] handles both handshakes already. The one extra
+//! step is calling `enable_connect_protocol()` on hyper's HTTP/2 server builder, which is
+//! what advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`. See the `http2_server` example.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -202,6 +227,19 @@ pub enum WebSocketError {
     #[error("Invalid http scheme")]
     InvalidHttpScheme,
 
+    /// The peer does not support RFC 8441 extended CONNECT.
+    ///
+    /// A server that has not advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL` rejects the
+    /// extended CONNECT stream instead of upgrading it.
+    #[error("Peer does not support extended CONNECT (RFC 8441)")]
+    #[cfg(all(feature = "http2", not(target_arch = "wasm32")))]
+    ExtendedConnectNotSupported,
+
+    /// A CONNECT request arrived without `:protocol = websocket`.
+    #[error("CONNECT request is missing the websocket protocol pseudo-header")]
+    #[cfg(all(feature = "http2", not(target_arch = "wasm32")))]
+    MissingConnectProtocol,
+
     /// Received compressed frame but compression not negotiated.
     #[error("Received compressed frame on stream that doesn't support compression")]
     #[cfg(not(target_arch = "wasm32"))]
@@ -254,6 +292,14 @@ impl WebSocketError {
     /// Returns `true` if this is a handshake error.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn is_handshake_error(&self) -> bool {
+        #[cfg(feature = "http2")]
+        if matches!(
+            self,
+            Self::ExtendedConnectNotSupported | Self::MissingConnectProtocol
+        ) {
+            return true;
+        }
+
         matches!(
             self,
             Self::InvalidStatusCode(_)
