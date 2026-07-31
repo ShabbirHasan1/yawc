@@ -237,8 +237,6 @@ pub(crate) struct CompressionConfig {
     outgoing: HalfConfig,
     /// Settings for the direction we decompress.
     incoming: HalfConfig,
-    /// Send already-compressed payloads without deflating them again.
-    pub(crate) skip_incompressible: bool,
 }
 
 impl CompressionConfig {
@@ -255,7 +253,6 @@ impl CompressionConfig {
     pub(crate) fn resolve(
         extensions: Option<&WebSocketExtensions>,
         level: Option<CompressionLevel>,
-        skip_incompressible: bool,
         role: Role,
     ) -> crate::Result<Option<Self>> {
         let Some(extensions) = extensions else {
@@ -290,7 +287,6 @@ impl CompressionConfig {
             level,
             outgoing,
             incoming,
-            skip_incompressible,
         }))
     }
 
@@ -459,58 +455,6 @@ fn inflate_error(err: DecompressError) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("Decompression error: {err}"),
     )
-}
-
-/// Payloads below this size are always compressed: the sampling is not reliable on a
-/// short payload, and the work saved would be negligible anyway.
-pub(crate) const INCOMPRESSIBLE_MIN_LEN: usize = 1024;
-
-/// Number of bytes sampled when estimating whether a payload is already compressed.
-const ENTROPY_SAMPLE: usize = 2048;
-
-/// Shannon entropy above which a payload is treated as already compressed.
-///
-/// Compressed and encrypted data sits at ~7.9-8.0 bits per byte; text, JSON and most
-/// binary formats sit well below 7. The gap is wide, so the exact cutoff is not
-/// delicate.
-const INCOMPRESSIBLE_ENTROPY: f32 = 7.5;
-
-/// Estimates whether `data` is already compressed, and so not worth deflating.
-///
-/// Deflating already-compressed input is the most expensive case there is and makes the
-/// payload larger, so it is worth a cheap check first. This samples evenly across the
-/// payload rather than reading a prefix, since compressed formats often start with a
-/// low-entropy header.
-///
-/// Being wrong is not a correctness problem in either direction: a false positive sends
-/// a compressible message uncompressed, a false negative wastes the work it would have
-/// spent anyway.
-pub(crate) fn looks_incompressible(data: &[u8]) -> bool {
-    let mut histogram = [0u32; 256];
-    let mut sampled = 0u32;
-
-    // Stride so the sample spans the whole payload.
-    let stride = (data.len() / ENTROPY_SAMPLE).max(1);
-    for byte in data.iter().step_by(stride).take(ENTROPY_SAMPLE) {
-        histogram[*byte as usize] += 1;
-        sampled += 1;
-    }
-
-    if sampled == 0 {
-        return false;
-    }
-
-    let total = sampled as f32;
-    let entropy: f32 = histogram
-        .iter()
-        .filter(|count| **count > 0)
-        .map(|count| {
-            let p = *count as f32 / total;
-            -p * p.log2()
-        })
-        .sum();
-
-    entropy >= INCOMPRESSIBLE_ENTROPY
 }
 
 /// Returns a mutable slice to the next available chunk of memory in the BytesMut buffer.
@@ -735,8 +679,7 @@ mod tests {
     use flate2::Compression;
 
     use crate::compression::{
-        looks_incompressible, CompressionConfig, Compressor, Decompressor, Deflate, HalfConfig,
-        Inflate, INCOMPRESSIBLE_MIN_LEN, WINDOW_BITS,
+        CompressionConfig, Compressor, Decompressor, Deflate, HalfConfig, Inflate, WINDOW_BITS,
     };
     use crate::{CompressionLevel, Role, WebSocketError};
 
@@ -2059,67 +2002,6 @@ mod tests {
         assert!(!inflate.stream_ended);
     }
 
-    #[test]
-    fn test_looks_incompressible_detects_random_data() {
-        let mut rng = Rng(0x9e37_79b9);
-        for _ in 0..64 {
-            let data = rng.bytes(4096);
-            assert!(
-                looks_incompressible(&data),
-                "random bytes should read as already compressed"
-            );
-        }
-    }
-
-    #[test]
-    fn test_looks_incompressible_detects_deflated_data() {
-        let mut rng = Rng(0x1111);
-        for _ in 0..32 {
-            let len = 4096 + rng.below(4096);
-            let text: Vec<u8> = (0..len).map(|i| b"abcdefghij "[i % 11]).collect();
-
-            let mut deflate = Deflate::new(Compression::best());
-            let compressed = deflate.compress(&text, true).expect("compression failed");
-
-            // Only meaningful once the output is long enough to sample.
-            if compressed.len() >= INCOMPRESSIBLE_MIN_LEN {
-                assert!(
-                    looks_incompressible(&compressed),
-                    "deflate output should read as already compressed"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_looks_incompressible_passes_real_payloads() {
-        let json: Vec<u8> = (0..200)
-            .flat_map(|i| {
-                format!(r#"{{"id":{i},"event":"TransactionEvent","ok":true,"seq":{i}}},"#)
-                    .into_bytes()
-            })
-            .collect();
-        assert!(!looks_incompressible(&json), "json should be compressed");
-
-        let text = "the quick brown fox jumps over the lazy dog. "
-            .repeat(200)
-            .into_bytes();
-        assert!(!looks_incompressible(&text), "text should be compressed");
-
-        let zeros = vec![0u8; 8192];
-        assert!(!looks_incompressible(&zeros), "zeros should be compressed");
-
-        // A compressed blob behind a low-entropy header: sampling the prefix alone
-        // would misread this as compressible.
-        let mut rng = Rng(0x2222);
-        let mut framed = vec![0u8; 512];
-        framed.extend_from_slice(&rng.bytes(8192));
-        assert!(
-            looks_incompressible(&framed),
-            "a low-entropy header should not hide the body"
-        );
-    }
-
     /// The role decides which negotiated half applies to which direction. Getting this
     /// backwards would still round trip against yawc itself, so it is pinned here.
     #[test]
@@ -2132,10 +2014,10 @@ mod tests {
         };
         let level = Some(CompressionLevel::default());
 
-        let client = CompressionConfig::resolve(Some(&extensions), level, false, Role::Client)
+        let client = CompressionConfig::resolve(Some(&extensions), level, Role::Client)
             .expect("resolve")
             .expect("negotiated");
-        let server = CompressionConfig::resolve(Some(&extensions), level, false, Role::Server)
+        let server = CompressionConfig::resolve(Some(&extensions), level, Role::Server)
             .expect("resolve")
             .expect("negotiated");
 
@@ -2166,7 +2048,6 @@ mod tests {
                 let config = CompressionConfig::resolve(
                     Some(&extensions),
                     Some(CompressionLevel::default()),
-                    false,
                     role,
                 )
                 .expect("resolve")
@@ -2188,13 +2069,9 @@ mod tests {
     /// never offered; this used to panic on an unwrap instead.
     #[test]
     fn test_compression_config_rejects_unoffered_extension() {
-        let err = CompressionConfig::resolve(
-            Some(&WebSocketExtensions::default()),
-            None,
-            false,
-            Role::Client,
-        )
-        .expect_err("an unoffered extension must be rejected");
+        let err =
+            CompressionConfig::resolve(Some(&WebSocketExtensions::default()), None, Role::Client)
+                .expect_err("an unoffered extension must be rejected");
 
         assert!(matches!(err, WebSocketError::CompressionNotSupported));
     }
@@ -2202,7 +2079,7 @@ mod tests {
     /// No extension negotiated means no compression, not an error.
     #[test]
     fn test_compression_config_absent_without_extension() {
-        let config = CompressionConfig::resolve(None, None, false, Role::Client).expect("resolve");
+        let config = CompressionConfig::resolve(None, None, Role::Client).expect("resolve");
         assert!(config.is_none());
     }
 }

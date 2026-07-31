@@ -162,8 +162,6 @@ pub struct Streaming<S> {
     deflate: Option<Compressor>,
     // decompressor
     inflate: Option<Decompressor>,
-    // skip deflating payloads that are already compressed
-    skip_incompressible: bool,
 }
 
 impl<S> Streaming<S>
@@ -192,7 +190,6 @@ where
             flush_sends: false,
             deflate: negotiated.compressor(),
             inflate: negotiated.decompressor(),
-            skip_incompressible: negotiated.skip_incompressible(),
         }
     }
 
@@ -418,22 +415,10 @@ where
         let should_compress = !item.opcode.is_control();
         if should_compress {
             if let Some(deflate) = this.deflate.as_mut() {
-                // Only a complete, unfragmented message may opt out: a fragment shares
-                // its deflate stream with the fragments around it, so skipping one
-                // would corrupt the message. `streaming` is still the state left by the
-                // previous frame at this point, so it tells us whether one is in flight.
-                let skip = this.skip_incompressible
-                    && !this.write_half.streaming
-                    && item.is_fin()
-                    && item.payload.len() >= crate::compression::INCOMPRESSIBLE_MIN_LEN
-                    && crate::compression::looks_incompressible(&item.payload);
-
-                if !skip {
-                    let output = deflate.compress(&item.payload, item.is_fin())?;
-                    // Set the RSV1 bit only when we are not streaming
-                    item.is_compressed = !this.write_half.streaming;
-                    item.payload = output;
-                }
+                let output = deflate.compress(&item.payload, item.is_fin())?;
+                // Set the RSV1 bit only when we are not streaming
+                item.is_compressed = !this.write_half.streaming;
+                item.payload = output;
             }
         }
 

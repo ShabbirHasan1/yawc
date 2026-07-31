@@ -237,10 +237,6 @@ impl Negotiation {
         let compression = CompressionConfig::resolve(
             extensions.as_ref(),
             options.compression.as_ref().map(|deflate| deflate.level),
-            options
-                .compression
-                .as_ref()
-                .is_some_and(|deflate| deflate.skip_incompressible),
             role,
         )?;
 
@@ -271,11 +267,6 @@ impl Negotiation {
         self.compression
             .as_ref()
             .map(CompressionConfig::decompressor)
-    }
-
-    pub(crate) fn skip_incompressible(&self) -> bool {
-        self.compression
-            .is_some_and(|compression| compression.skip_incompressible)
     }
 }
 
@@ -2303,65 +2294,6 @@ mod tests {
 
             assert_eq!(opcode, OpCode::Text);
             assert_eq!(payload, TEXT.as_bytes());
-        }
-    }
-
-    /// Deflating already-compressed data costs the most CPU of any input and makes the
-    /// frame larger, so `skip_incompressible` sends it as-is. The peer must still
-    /// receive it intact, and compressible traffic must be unaffected.
-    #[tokio::test]
-    async fn test_skip_incompressible_round_trip() {
-        fn negotiation(skip_incompressible: bool, role: Role) -> Negotiation {
-            let mut options =
-                Options::default().with_compression_level(CompressionLevel::default());
-            if skip_incompressible {
-                options = options.skip_incompressible();
-            }
-            Negotiation::new(Some(WebSocketExtensions::default()), &options, role)
-                .expect("negotiation")
-        }
-
-        // Deterministic high-entropy payload, as an already-compressed body would be.
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let incompressible: Vec<u8> = (0..8192)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state as u8
-            })
-            .collect();
-        let compressible = b"the quick brown fox jumps over the lazy dog. ".repeat(200);
-
-        for skip in [false, true] {
-            let (client_stream, server_stream) = MockStream::pair(1 << 16);
-            let mut client = WebSocket::new(
-                Role::Client,
-                client_stream,
-                Bytes::new(),
-                negotiation(skip, Role::Client),
-            );
-            let mut server = WebSocket::new(
-                Role::Server,
-                server_stream,
-                Bytes::new(),
-                negotiation(skip, Role::Server),
-            );
-
-            for payload in [incompressible.clone(), compressible.clone()] {
-                client
-                    .send(Frame::binary(payload.clone()))
-                    .await
-                    .expect("send failed");
-
-                let frame = server.next_frame().await.expect("receive failed");
-                assert_eq!(frame.opcode(), OpCode::Binary);
-                assert_eq!(
-                    frame.payload(),
-                    &payload[..],
-                    "payload corrupted with skip_incompressible={skip}"
-                );
-            }
         }
     }
 
