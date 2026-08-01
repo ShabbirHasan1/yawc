@@ -11,7 +11,12 @@ use std::{convert::Infallible, net::SocketAddr};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use http_body_util::Empty;
-use hyper::{body::Incoming, server::conn::http2, service::service_fn, Request, Response};
+use hyper::{
+    body::Incoming,
+    server::conn::{http1, http2},
+    service::service_fn,
+    Request, Response,
+};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use yawc::{
@@ -70,10 +75,39 @@ async fn handle(
     Ok(response)
 }
 
+/// Starts an HTTP/1.1 echo server, for checking the version selection falls back cleanly.
+async fn spawn_http1_echo_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|req| handle(req, Options::default()));
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
 /// Connects to `addr` over HTTP/2 prior knowledge.
 async fn connect(addr: SocketAddr, options: Options) -> yawc::Result<HttpWebSocket> {
+    connect_with(addr, options, HttpVersion::Http2).await
+}
+
+/// Connects to `addr` with an explicit version selection.
+async fn connect_with(
+    addr: SocketAddr,
+    options: Options,
+    version: HttpVersion,
+) -> yawc::Result<HttpWebSocket> {
     WebSocket::connect(format!("ws://{addr}/chat").parse()?)
-        .http_version(HttpVersion::Http2)
+        .http_version(version)
         .with_options(options)
         .await
 }
@@ -203,6 +237,76 @@ async fn server_without_connect_protocol_is_reported_clearly() {
     assert!(
         err.is_handshake_error(),
         "expected a handshake error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn ping_is_answered_with_a_pong() {
+    let addr = spawn_echo_server(Options::default()).await;
+    let mut ws = connect(addr, Options::default()).await.unwrap();
+
+    ws.send(Frame::ping(&b"knock"[..])).await.unwrap();
+
+    let frame = ws.next().await.unwrap();
+    assert_eq!(frame.opcode(), OpCode::Pong);
+    assert_eq!(frame.payload().as_ref(), b"knock");
+}
+
+#[tokio::test]
+async fn http1_version_uses_the_upgrade_handshake() {
+    // Selecting a version routes through the same builder as HTTP/2 but must still speak
+    // the RFC 6455 handshake, against a server that only knows HTTP/1.1.
+    let addr = spawn_http1_echo_server().await;
+    let mut ws = connect_with(addr, Options::default(), HttpVersion::Http1)
+        .await
+        .unwrap();
+
+    ws.send(Frame::text("over http/1.1")).await.unwrap();
+
+    let frame = ws.next().await.unwrap();
+    assert_eq!(frame.payload().as_ref(), b"over http/1.1");
+}
+
+#[tokio::test]
+async fn auto_over_plaintext_falls_back_to_http1() {
+    // Plaintext has no ALPN to negotiate with, so Auto must not assume HTTP/2 prior
+    // knowledge; it has to work against an ordinary HTTP/1.1 server.
+    let addr = spawn_http1_echo_server().await;
+    let mut ws = connect_with(addr, Options::default(), HttpVersion::Auto)
+        .await
+        .unwrap();
+
+    ws.send(Frame::text("negotiated down")).await.unwrap();
+
+    let frame = ws.next().await.unwrap();
+    assert_eq!(frame.payload().as_ref(), b"negotiated down");
+}
+
+#[tokio::test]
+async fn http1_version_carries_compression() {
+    let addr = spawn_http1_echo_server().await;
+    let options = Options::default().with_balanced_compression();
+
+    let mut ws = connect_with(addr, options, HttpVersion::Http1)
+        .await
+        .unwrap();
+
+    let payload = "deflate me ".repeat(2048);
+    ws.send(Frame::text(payload.clone())).await.unwrap();
+
+    let frame = ws.next().await.unwrap();
+    assert_eq!(frame.payload().as_ref(), payload.as_bytes());
+}
+
+#[tokio::test]
+async fn http2_against_an_http1_server_fails_rather_than_hanging() {
+    let addr = spawn_http1_echo_server().await;
+
+    let result = connect_with(addr, Options::default(), HttpVersion::Http2).await;
+
+    assert!(
+        result.is_err(),
+        "expected HTTP/2 prior knowledge to fail against an HTTP/1.1 server"
     );
 }
 

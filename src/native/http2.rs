@@ -27,7 +27,10 @@ use std::str::FromStr;
 
 use bytes::Bytes;
 use http_body_util::Empty;
-use hyper::{ext::Protocol, header, http::Extensions, Method, Request, Response, StatusCode};
+use hyper::{
+    ext::Protocol, header, header::HeaderValue, http::Extensions, Method, Request, Response,
+    StatusCode,
+};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite};
 use url::Url;
@@ -83,14 +86,20 @@ pub(super) fn build_request(
     let path = &url[url::Position::BeforePath..];
     let uri = format!("{scheme}://{authority}{path}");
 
-    // RFC 8441 section 5: no Sec-WebSocket-Key, no Upgrade, no Connection. The version
-    // header stays, so a server can still reject a version it does not speak.
+    // RFC 8441 section 5: no Sec-WebSocket-Key, no Upgrade, no Connection.
     let mut request = builder
         .method(Method::CONNECT)
         .uri(uri)
-        .header(header::SEC_WEBSOCKET_VERSION, "13")
         .body(Empty::<Bytes>::new())
         .expect("request build");
+
+    // Inserted rather than appended: 13 is the only version this speaks, and a caller
+    // that set the header on `builder` would otherwise leave the request carrying two
+    // conflicting values.
+    request.headers_mut().insert(
+        header::SEC_WEBSOCKET_VERSION,
+        HeaderValue::from_static("13"),
+    );
 
     request
         .extensions_mut()
@@ -292,6 +301,38 @@ mod tests {
 
         assert_eq!(req.uri().scheme_str(), Some("http"));
         assert_eq!(req.uri().authority().unwrap().as_str(), "example.com:8080");
+    }
+
+    #[test]
+    fn caller_cannot_override_the_websocket_version() {
+        // A caller-supplied version must be replaced, not appended, or the request goes
+        // out with two conflicting values and the server picks whichever it reads first.
+        let req = build_request(
+            &"wss://example.com/chat".parse().unwrap(),
+            &Options::default(),
+            hyper::Request::builder().header(header::SEC_WEBSOCKET_VERSION, "8"),
+        )
+        .unwrap();
+
+        let versions: Vec<_> = req
+            .headers()
+            .get_all(header::SEC_WEBSOCKET_VERSION)
+            .iter()
+            .collect();
+
+        assert_eq!(versions, vec!["13"]);
+    }
+
+    #[test]
+    fn caller_headers_are_preserved() {
+        let req = build_request(
+            &"wss://example.com/chat".parse().unwrap(),
+            &Options::default(),
+            hyper::Request::builder().header("authorization", "Bearer token"),
+        )
+        .unwrap();
+
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer token");
     }
 
     #[test]
