@@ -250,10 +250,23 @@ pub enum HttpVersion {
     /// configured to expect it.
     Http2,
 
-    /// Let ALPN decide, preferring HTTP/2.
+    /// Use HTTP/2 where it actually works, otherwise HTTP/1.1.
     ///
-    /// Over `wss://` this offers `h2` and `http/1.1` and follows whatever the server
-    /// picks. Over `ws://` there is nothing to negotiate with, so this is HTTP/1.1.
+    /// Over `wss://` this offers `h2` and `http/1.1` over ALPN. If the server picks `h2`
+    /// but then refuses the extended CONNECT, the connection is retried over HTTP/1.1 on
+    /// a fresh connection, because ALPN has already committed the first one to HTTP/2.
+    ///
+    /// That retry is not a corner case. Negotiating `h2` only says the peer speaks
+    /// HTTP/2, not that it implements RFC 8441, and most deployments serve `h2` for
+    /// ordinary requests while accepting WebSockets over HTTP/1.1 only, so the fallback
+    /// is the common path rather than the exception.
+    ///
+    /// Over `ws://` there is nothing to negotiate with, so this is HTTP/1.1. Prior
+    /// knowledge is not assumed, since it would break an ordinary HTTP/1.1 server.
+    ///
+    /// The cost of the fallback is one extra connection attempt against servers that do
+    /// not support RFC 8441. Use [`HttpVersion::Http1`] to avoid it when the peer is
+    /// known not to, or [`HttpVersion::Http2`] to fail loudly when it should.
     Auto,
 }
 

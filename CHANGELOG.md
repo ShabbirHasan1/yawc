@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   using extended CONNECT instead of the HTTP/1.1 `Upgrade` handshake. Only the handshake
   changes; framing, masking and permessage-deflate are unchanged.
   - Client: `WebSocket::connect(url).http_version(HttpVersion::Http2 | Auto | Http1)`.
-    `Auto` negotiates over ALPN and falls back to HTTP/1.1.
+    `Auto` offers both over ALPN, and if the peer picks `h2` but then refuses the
+    extended CONNECT, retries over HTTP/1.1 on a fresh connection. Negotiating `h2` only
+    means the peer speaks HTTP/2, not that it implements RFC 8441, so against most
+    deployments that retry is the normal path rather than an edge case.
   - Server: `WebSocket::upgrade` and `WebSocket::upgrade_with_options` detect extended
     CONNECT and take the HTTP/2 path, so one handler serves both versions. The hyper
     HTTP/2 server builder must have `enable_connect_protocol()` set.

@@ -1433,6 +1433,80 @@ async fn connect_versioned(
     builder: HttpRequestBuilder,
     version: HttpVersion,
 ) -> Result<HttpWebSocket> {
+    // The builder is consumed by whichever handshake runs, but Auto may need to build a
+    // second request after a failed one, so the caller's headers are kept aside.
+    let headers = builder.headers_ref().cloned().unwrap_or_default();
+
+    let (stream, use_http2) = dial(&url, tcp_address, connector.clone(), &options, version).await?;
+
+    if !use_http2 {
+        return handshake_http1_upgraded(url, stream, options, builder).await;
+    }
+
+    let attempt = http2::handshake(
+        url.clone(),
+        stream,
+        options.clone(),
+        builder_with_headers(&headers),
+    )
+    .await;
+
+    match attempt {
+        Ok(ws) => Ok(ws),
+        // ALPN only says the peer speaks HTTP/2, not that it implements RFC 8441, and
+        // most deployments serve h2 for ordinary requests while handling WebSockets over
+        // HTTP/1.1 only. Auto promised to negotiate, so it dials again rather than
+        // failing a connection that HTTP/1.1 would have made. The retry needs a new
+        // connection because ALPN already committed this one to h2.
+        Err(err) if version == HttpVersion::Auto && is_extended_connect_refused(&err) => {
+            log::debug!("extended CONNECT refused ({err}), retrying over http/1.1");
+
+            let (stream, _) =
+                dial(&url, tcp_address, connector, &options, HttpVersion::Http1).await?;
+
+            handshake_http1_upgraded(url, stream, options, builder).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether an error means the peer does not do RFC 8441, as opposed to a connection or
+/// protocol problem that HTTP/1.1 would hit too.
+///
+/// A server that never enabled extended CONNECT either resets the stream or answers with
+/// a client error. Anything else, an I/O failure or a malformed response, is not
+/// something a second attempt would fix.
+#[cfg(feature = "http2")]
+fn is_extended_connect_refused(err: &WebSocketError) -> bool {
+    match err {
+        WebSocketError::ExtendedConnectNotSupported => true,
+        WebSocketError::InvalidStatusCode(code) => (400..500).contains(code),
+        _ => false,
+    }
+}
+
+/// Rebuilds a request builder from a set of caller-supplied headers.
+///
+/// [`HttpRequestBuilder`] cannot be cloned, so a retry has to reconstruct it. Iterating
+/// the map yields one entry per value, and `header` appends, so repeated headers survive.
+#[cfg(feature = "http2")]
+fn builder_with_headers(headers: &hyper::HeaderMap) -> HttpRequestBuilder {
+    headers
+        .iter()
+        .fold(HttpRequest::builder(), |builder, (name, value)| {
+            builder.header(name, value)
+        })
+}
+
+/// Opens a connection and reports whether the HTTP/2 handshake should be used on it.
+#[cfg(feature = "http2")]
+async fn dial(
+    url: &Url,
+    tcp_address: Option<SocketAddr>,
+    connector: Option<TlsConnector>,
+    options: &Options,
+    version: HttpVersion,
+) -> Result<(MaybeTlsStream<TcpStream>, bool)> {
     let host = url.host().expect("hostname").to_string();
 
     let tcp_stream = if let Some(tcp_address) = tcp_address {
@@ -1445,12 +1519,13 @@ async fn connect_versioned(
     let _ = tcp_stream.set_nodelay(options.no_delay);
 
     // Over plaintext there is no ALPN to consult, so the version has to be assumed:
-    // HTTP/2 means prior knowledge, anything else means HTTP/1.1.
-    let (stream, use_http2) = match url.scheme() {
-        "ws" => (
+    // HTTP/2 means prior knowledge, anything else means HTTP/1.1. Auto stays on HTTP/1.1
+    // rather than guessing, since prior knowledge would break an ordinary HTTP/1.1 server.
+    match url.scheme() {
+        "ws" => Ok((
             MaybeTlsStream::Plain(tcp_stream),
             version == HttpVersion::Http2,
-        ),
+        )),
         "wss" => {
             let connector = connector.unwrap_or_else(|| tls_connector_with_alpn(alpn_for(version)));
             let domain = ServerName::try_from(host)
@@ -1467,15 +1542,9 @@ async fn connect_versioned(
                 HttpVersion::Auto => negotiated_h2,
             };
 
-            (MaybeTlsStream::Tls(tls_stream), use_http2)
+            Ok((MaybeTlsStream::Tls(tls_stream), use_http2))
         }
-        _ => return Err(WebSocketError::InvalidHttpScheme),
-    };
-
-    if use_http2 {
-        http2::handshake(url, stream, options, builder).await
-    } else {
-        handshake_http1_upgraded(url, stream, options, builder).await
+        _ => Err(WebSocketError::InvalidHttpScheme),
     }
 }
 
@@ -1611,6 +1680,67 @@ mod tests {
 
     use super::*;
     use futures::SinkExt;
+
+    /// Which failures make [`HttpVersion::Auto`] retry over HTTP/1.1.
+    ///
+    /// Retrying costs a whole extra connection, so it has to fire for a peer that simply
+    /// never enabled RFC 8441 and stay out of the way for anything HTTP/1.1 would hit
+    /// too. Against real endpoints both shapes show up: some reset the stream, most
+    /// answer 400.
+    #[cfg(feature = "http2")]
+    #[test]
+    fn auto_retries_only_when_extended_connect_was_refused() {
+        assert!(is_extended_connect_refused(
+            &WebSocketError::ExtendedConnectNotSupported
+        ));
+        assert!(is_extended_connect_refused(
+            &WebSocketError::InvalidStatusCode(400)
+        ));
+        assert!(is_extended_connect_refused(
+            &WebSocketError::InvalidStatusCode(404)
+        ));
+
+        // A server error is the peer failing, not the peer lacking RFC 8441, and a
+        // redirect or success code means the response was simply not what a handshake
+        // looks like. Neither improves by dialing again.
+        assert!(!is_extended_connect_refused(
+            &WebSocketError::InvalidStatusCode(500)
+        ));
+        assert!(!is_extended_connect_refused(
+            &WebSocketError::InvalidStatusCode(301)
+        ));
+
+        // Transport and protocol failures repeat over HTTP/1.1, so retrying only doubles
+        // the wait.
+        assert!(!is_extended_connect_refused(&WebSocketError::IoError(
+            io::Error::new(io::ErrorKind::ConnectionRefused, "nope")
+        )));
+        assert!(!is_extended_connect_refused(
+            &WebSocketError::InvalidHttpScheme
+        ));
+        assert!(!is_extended_connect_refused(
+            &WebSocketError::CompressionNotSupported
+        ));
+    }
+
+    /// The caller's headers have to survive being rebuilt for the retry, including
+    /// repeated ones, or a fallback would quietly drop authentication.
+    #[cfg(feature = "http2")]
+    #[test]
+    fn rebuilt_builder_keeps_every_caller_header() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        headers.append("cookie", "a=1".parse().unwrap());
+        headers.append("cookie", "b=2".parse().unwrap());
+
+        let rebuilt = builder_with_headers(&headers);
+        let rebuilt = rebuilt.headers_ref().expect("headers");
+
+        assert_eq!(rebuilt.get("authorization").unwrap(), "Bearer token");
+
+        let cookies: Vec<_> = rebuilt.get_all("cookie").iter().collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+    }
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
