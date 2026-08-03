@@ -78,7 +78,8 @@
 //! the RFC 8441 extended CONNECT handshake instead of the HTTP/1.1 `Upgrade` handshake.
 //! Only the handshake changes: framing, masking and `permessage-deflate` are the same.
 //!
-//! On the client, pick the version on the builder:
+//! The client stays on HTTP/1.1 unless asked otherwise, so this changes nothing for
+//! existing code. Ask for HTTP/2 explicitly when the server is known to support it:
 //!
 //! ```no_run
 //! # #[cfg(feature = "http2")]
@@ -86,11 +87,17 @@
 //!     use yawc::{HttpVersion, WebSocket};
 //!
 //!     let ws = WebSocket::connect("wss://example.com/chat".parse()?)
-//!         .http_version(HttpVersion::Auto)
+//!         .http_version(HttpVersion::Http2)
 //!         .await?;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! There is deliberately no automatic negotiation. Agreeing on `h2` over ALPN says the
+//! peer speaks HTTP/2, not that it implements RFC 8441, and most deployments serve `h2`
+//! for ordinary requests while accepting WebSockets over HTTP/1.1 only. Choosing HTTP/2
+//! against such a peer fails rather than silently downgrading, so the choice stays with
+//! the caller who knows what the server does.
 //!
 //! On the server, [`WebSocket::upgrade`] handles both handshakes already. The one extra
 //! step is calling `enable_connect_protocol()` on hyper's HTTP/2 server builder, which is

@@ -12,9 +12,10 @@
 //! cargo run --features http2 --example http2_client
 //! ```
 //!
-//! Pass a `wss://` URL as the first argument to talk to a real endpoint, in which case
-//! [`HttpVersion::Auto`] negotiates HTTP/2 over ALPN and quietly falls back to HTTP/1.1
-//! when the server does not support RFC 8441.
+//! Pass a `wss://` URL as the first argument to talk to a real endpoint. Note that this
+//! fails against a server that does not implement RFC 8441, which is most of them: the
+//! HTTP/2 handshake is opt-in and does not fall back. Drop the `http_version` call to use
+//! the default HTTP/1.1 handshake instead.
 
 use futures::{SinkExt, StreamExt};
 use yawc::{frame::OpCode, Frame, HttpVersion, Options, WebSocket};
@@ -25,16 +26,10 @@ async fn main() -> anyhow::Result<()> {
         .nth(1)
         .unwrap_or_else(|| "ws://127.0.0.1:9002/chat".to_string());
 
-    // Plaintext has no ALPN to negotiate with, so it needs HTTP/2 prior knowledge.
-    // Anything over TLS can let ALPN decide.
-    let version = if url.starts_with("wss://") {
-        HttpVersion::Auto
-    } else {
-        HttpVersion::Http2
-    };
-
+    // Over plaintext this is HTTP/2 prior knowledge; over TLS it offers only the h2 ALPN
+    // protocol. Either way the peer has to implement RFC 8441 or the connection fails.
     let mut ws = WebSocket::connect(url.parse()?)
-        .http_version(version)
+        .http_version(HttpVersion::Http2)
         .with_options(Options::default().with_balanced_compression())
         .await?;
 

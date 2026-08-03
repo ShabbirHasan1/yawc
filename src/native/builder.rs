@@ -201,7 +201,9 @@ impl WebSocketBuilder {
     /// [`TcpWebSocket`](super::TcpWebSocket). An HTTP/2 WebSocket lives on one stream of
     /// a multiplexed connection, so there is no underlying socket to hand back.
     ///
-    /// Leaving this alone keeps the HTTP/1.1 handshake and the existing return type.
+    /// Leaving this alone keeps the HTTP/1.1 handshake and the existing return type,
+    /// which is what almost every peer wants: RFC 8441 support is rare enough that
+    /// HTTP/2 is worth asking for only when the server is known to implement it.
     ///
     /// # Example
     ///
@@ -210,7 +212,7 @@ impl WebSocketBuilder {
     ///
     /// # async fn example() -> yawc::Result<()> {
     /// let ws = WebSocket::connect("wss://example.com/chat".parse()?)
-    ///     .http_version(HttpVersion::Auto)
+    ///     .http_version(HttpVersion::Http2)
     ///     .await?;
     /// # Ok(())
     /// # }
@@ -242,32 +244,19 @@ pub enum HttpVersion {
     #[default]
     Http1,
 
-    /// Always use the HTTP/2 extended CONNECT handshake.
+    /// Use the HTTP/2 extended CONNECT handshake.
     ///
     /// Over `wss://` this offers only the `h2` ALPN protocol, so a server that cannot
     /// speak HTTP/2 fails the TLS handshake rather than silently falling back. Over
     /// `ws://` it assumes HTTP/2 prior knowledge, which only works against a server
     /// configured to expect it.
+    ///
+    /// This is an explicit choice because RFC 8441 support is rare: negotiating `h2` only
+    /// means the peer speaks HTTP/2, and most deployments serve `h2` for ordinary
+    /// requests while accepting WebSockets over HTTP/1.1 only. Against such a peer this
+    /// fails rather than downgrading, so use it when the server is known to implement
+    /// RFC 8441. Everything else should stay on the default HTTP/1.1 handshake.
     Http2,
-
-    /// Use HTTP/2 where it actually works, otherwise HTTP/1.1.
-    ///
-    /// Over `wss://` this offers `h2` and `http/1.1` over ALPN. If the server picks `h2`
-    /// but then refuses the extended CONNECT, the connection is retried over HTTP/1.1 on
-    /// a fresh connection, because ALPN has already committed the first one to HTTP/2.
-    ///
-    /// That retry is not a corner case. Negotiating `h2` only says the peer speaks
-    /// HTTP/2, not that it implements RFC 8441, and most deployments serve `h2` for
-    /// ordinary requests while accepting WebSockets over HTTP/1.1 only, so the fallback
-    /// is the common path rather than the exception.
-    ///
-    /// Over `ws://` there is nothing to negotiate with, so this is HTTP/1.1. Prior
-    /// knowledge is not assumed, since it would break an ordinary HTTP/1.1 server.
-    ///
-    /// The cost of the fallback is one extra connection attempt against servers that do
-    /// not support RFC 8441. Use [`HttpVersion::Http1`] to avoid it when the peer is
-    /// known not to, or [`HttpVersion::Http2`] to fail loudly when it should.
-    Auto,
 }
 
 /// Builder for a WebSocket connection with an explicit HTTP version.

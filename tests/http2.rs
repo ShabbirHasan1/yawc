@@ -269,18 +269,20 @@ async fn http1_version_uses_the_upgrade_handshake() {
 }
 
 #[tokio::test]
-async fn auto_over_plaintext_falls_back_to_http1() {
-    // Plaintext has no ALPN to negotiate with, so Auto must not assume HTTP/2 prior
-    // knowledge; it has to work against an ordinary HTTP/1.1 server.
+async fn the_default_version_is_http1() {
+    // Selecting a version is opt-in, and the default must not drag an existing caller
+    // onto the RFC 8441 path.
+    assert_eq!(HttpVersion::default(), HttpVersion::Http1);
+
     let addr = spawn_http1_echo_server().await;
-    let mut ws = connect_with(addr, Options::default(), HttpVersion::Auto)
+    let mut ws = connect_with(addr, Options::default(), HttpVersion::default())
         .await
         .unwrap();
 
-    ws.send(Frame::text("negotiated down")).await.unwrap();
+    ws.send(Frame::text("default is 6455")).await.unwrap();
 
     let frame = ws.next().await.unwrap();
-    assert_eq!(frame.payload().as_ref(), b"negotiated down");
+    assert_eq!(frame.payload().as_ref(), b"default is 6455");
 }
 
 #[tokio::test]
