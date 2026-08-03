@@ -4,7 +4,8 @@
 //! through hyper's HTTP/2 builder directly. Everything runs over plaintext with HTTP/2
 //! prior knowledge, so no certificates are needed.
 
-#![cfg(all(feature = "http2", feature = "axum"))]
+// The wasm build compiles integration tests too, and none of this exists there.
+#![cfg(all(feature = "http2", feature = "axum", not(target_arch = "wasm32")))]
 
 use std::net::SocketAddr;
 

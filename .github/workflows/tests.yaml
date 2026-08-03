@@ -30,6 +30,9 @@ jobs:
         run: cargo test --verbose
       - name: Test zlib
         run: cargo test --verbose --features zlib
+      - name: Test http2
+        # axum comes along because the RFC 8441 extractor test needs both features.
+        run: cargo test --verbose --features http2,axum
       - name: Test WASM
         run: |
           env WASM_BINDGEN_USE_BROWSER=1 wasm-pack test --headless --chrome --lib

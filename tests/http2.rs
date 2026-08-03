@@ -4,7 +4,8 @@
 //! yawc's HTTP/2 handshake. Everything runs over plaintext TCP using HTTP/2 prior
 //! knowledge so the tests do not need certificates.
 
-#![cfg(feature = "http2")]
+// The wasm build compiles integration tests too, and none of this exists there.
+#![cfg(all(feature = "http2", not(target_arch = "wasm32")))]
 
 use std::{convert::Infallible, net::SocketAddr};
 

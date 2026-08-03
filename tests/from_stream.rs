@@ -4,6 +4,10 @@
 //! [`WebSocket::from_stream_with_extensions`], which perform no handshake and take the
 //! caller's word for the role and negotiated extensions.
 
+// The wasm build compiles integration tests too, and neither this API nor tokio's duplex
+// exists there.
+#![cfg(not(target_arch = "wasm32"))]
+
 use futures::{SinkExt, StreamExt};
 use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 use yawc::{frame::OpCode, Frame, Options, Role, WebSocket, WebSocketError};
