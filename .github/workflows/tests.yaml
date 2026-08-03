@@ -30,6 +30,10 @@ jobs:
         run: cargo test --verbose
       - name: Test zlib
         run: cargo test --verbose --features zlib
+      - name: Test axum
+        # Without http2, so the axum extractor is covered in the same shape the autobahn
+        # suite builds it: extended CONNECT compiled out.
+        run: cargo test --verbose --features axum,zlib
       - name: Test http2
         # axum comes along because the RFC 8441 extractor test needs both features.
         run: cargo test --verbose --features http2,axum
