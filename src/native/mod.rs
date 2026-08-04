@@ -156,7 +156,7 @@ use url::Url;
 // Re-exports
 pub use crate::stream::MaybeTlsStream;
 #[cfg(feature = "http2")]
-pub use builder::{Http2WebSocketBuilder, HttpVersion};
+pub use builder::HttpVersion;
 pub use builder::{HttpRequest, HttpRequestBuilder, WebSocketBuilder};
 pub use frame::{Frame, OpCode};
 pub use options::{CompressionLevel, DeflateOptions, Fragmentation, Options};

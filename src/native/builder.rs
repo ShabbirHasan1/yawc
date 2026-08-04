@@ -64,9 +64,17 @@ pub type HttpRequestBuilder = hyper::http::request::Builder;
 ///     todo!()
 /// }
 /// ```
-pub struct WebSocketBuilder {
+/// The `S` parameter is the stream the finished connection runs on, and it defaults to
+/// the plain or TLS socket that [`WebSocket::connect`] produces, so `WebSocketBuilder`
+/// keeps meaning what it always did.
+///
+/// Only [`http_version`](Self::http_version) changes it, to
+/// [`HttpStream`](super::HttpStream): an HTTP/2 WebSocket lives on one stream of a
+/// multiplexed connection, so there is no socket to hand back. The builder methods are
+/// shared, and only the `Future` impls differ.
+pub struct WebSocketBuilder<S = MaybeTlsStream<TcpStream>> {
     pub(super) opts: Option<WsBuilderOpts>,
-    pub(super) future: Option<BoxFuture<'static, Result<WebSocket<MaybeTlsStream<TcpStream>>>>>,
+    pub(super) future: Option<BoxFuture<'static, Result<WebSocket<S>>>>,
 }
 
 /// Internal options structure for WebSocketBuilder.
@@ -79,9 +87,11 @@ pub(super) struct WsBuilderOpts {
     pub(super) connector: Option<TlsConnector>,
     pub(super) establish_options: Option<Options>,
     pub(super) http_builder: Option<HttpRequestBuilder>,
+    #[cfg(feature = "http2")]
+    pub(super) version: HttpVersion,
 }
 
-impl WebSocketBuilder {
+impl<S> WebSocketBuilder<S> {
     /// Creates a new WebSocketBuilder with the specified URL.
     ///
     /// Initializes a builder with default settings that can be customized
@@ -97,6 +107,8 @@ impl WebSocketBuilder {
                 connector: None,
                 establish_options: None,
                 http_builder: None,
+                #[cfg(feature = "http2")]
+                version: HttpVersion::Http1,
             }),
             future: None,
         }
@@ -193,7 +205,10 @@ impl WebSocketBuilder {
         opts.http_builder = Some(builder);
         self
     }
+}
 
+#[cfg(feature = "http2")]
+impl WebSocketBuilder {
     /// Selects the HTTP version used for the handshake.
     ///
     /// Reaching for this switches the connection to the RFC 8441 machinery and changes
@@ -204,6 +219,8 @@ impl WebSocketBuilder {
     /// Leaving this alone keeps the HTTP/1.1 handshake and the existing return type,
     /// which is what almost every peer wants: RFC 8441 support is rare enough that
     /// HTTP/2 is worth asking for only when the server is known to implement it.
+    ///
+    /// Every other builder method is available before or after this call.
     ///
     /// # Example
     ///
@@ -217,15 +234,15 @@ impl WebSocketBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "http2")]
     #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-    pub fn http_version(mut self, version: HttpVersion) -> Http2WebSocketBuilder {
-        let Some(opts) = self.opts.take() else {
+    pub fn http_version(mut self, version: HttpVersion) -> WebSocketBuilder<super::HttpStream> {
+        let Some(mut opts) = self.opts.take() else {
             unreachable!()
         };
-        Http2WebSocketBuilder {
+        opts.version = version;
+
+        WebSocketBuilder {
             opts: Some(opts),
-            version,
             future: None,
         }
     }
@@ -259,65 +276,15 @@ pub enum HttpVersion {
     Http2,
 }
 
-/// Builder for a WebSocket connection with an explicit HTTP version.
-///
-/// Returned by [`WebSocketBuilder::http_version`]. Resolves to an
-/// [`HttpWebSocket`](super::HttpWebSocket) regardless of which version is used, so the
-/// same code path works whether the handshake ends up on HTTP/1.1 or HTTP/2.
 #[cfg(feature = "http2")]
-#[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
-pub struct Http2WebSocketBuilder {
-    pub(super) opts: Option<WsBuilderOpts>,
-    pub(super) version: HttpVersion,
-    pub(super) future: Option<BoxFuture<'static, Result<super::HttpWebSocket>>>,
-}
-
-#[cfg(feature = "http2")]
-impl Http2WebSocketBuilder {
-    /// Sets a custom TLS connector.
-    ///
-    /// The connector's ALPN protocols are used as given, so a custom connector must
-    /// offer `h2` for [`HttpVersion::Http2`] to work.
-    pub fn with_connector(mut self, connector: TlsConnector) -> Self {
-        let Some(opts) = &mut self.opts else {
-            unreachable!()
-        };
-        opts.connector = Some(connector);
-        self
-    }
-
-    /// Sets a custom TCP address to connect to, bypassing hostname resolution.
-    pub fn with_tcp_address(mut self, address: SocketAddr) -> Self {
-        let Some(opts) = &mut self.opts else {
-            unreachable!()
-        };
-        opts.tcp_address = Some(address);
-        self
-    }
-
-    /// Sets WebSocket connection options.
-    pub fn with_options(mut self, options: Options) -> Self {
-        let Some(opts) = &mut self.opts else {
-            unreachable!()
-        };
-        opts.establish_options = Some(options);
-        self
-    }
-
-    /// Sets a custom HTTP request builder for the handshake.
-    pub fn with_request(mut self, builder: HttpRequestBuilder) -> Self {
-        let Some(opts) = &mut self.opts else {
-            unreachable!()
-        };
-        opts.http_builder = Some(builder);
-        self
-    }
-}
-
-#[cfg(feature = "http2")]
-impl Future for Http2WebSocketBuilder {
+impl Future for WebSocketBuilder<super::HttpStream> {
     type Output = Result<super::HttpWebSocket>;
 
+    /// Polls the future to establish the WebSocket connection.
+    ///
+    /// Mirrors the default builder's poll, but resolves to an
+    /// [`HttpWebSocket`](super::HttpWebSocket): the HTTP/2 handshake hands back a stream
+    /// of a multiplexed connection rather than the socket underneath it.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if let Some(opts) = this.opts.take() {
@@ -327,7 +294,7 @@ impl Future for Http2WebSocketBuilder {
                 opts.connector,
                 opts.establish_options.unwrap_or_default(),
                 opts.http_builder.unwrap_or_else(HttpRequest::builder),
-                this.version,
+                opts.version,
             );
             this.future = Some(Box::pin(future));
         }
