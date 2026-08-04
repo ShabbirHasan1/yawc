@@ -1096,7 +1096,7 @@ impl WebSocket<HttpStream> {
     /// the version check and extension negotiation, is the same either way.
     fn handshake_response<B>(request: &Request<B>) -> Result<hyper::http::response::Builder> {
         #[cfg(feature = "http2")]
-        if http2::is_extended_connect(request) {
+        if http2::is_extended_connect(request.method(), request.extensions()) {
             return Ok(Response::builder().status(StatusCode::OK));
         }
 

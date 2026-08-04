@@ -209,7 +209,7 @@ where
         // RFC 8441 drops the key exchange, so only the HTTP/1.1 handshake requires one.
         #[cfg(feature = "http2")]
         let is_extended_connect =
-            super::http2::is_websocket_connect(&parts.method, &parts.extensions);
+            super::http2::is_extended_connect(&parts.method, &parts.extensions);
         #[cfg(not(feature = "http2"))]
         let is_extended_connect = false;
 

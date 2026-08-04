@@ -44,12 +44,10 @@ pub(super) const WEBSOCKET_PROTOCOL: &str = "websocket";
 /// Used to pick between the HTTP/1.1 and HTTP/2 handshake paths on the server. A plain
 /// `CONNECT` without the `websocket` protocol is a tunnel request, not a WebSocket one,
 /// and is not matched here.
-pub(super) fn is_extended_connect<B>(request: &Request<B>) -> bool {
-    is_websocket_connect(request.method(), request.extensions())
-}
-
-/// Same check as [`is_extended_connect`], against a request's parts.
-pub(super) fn is_websocket_connect(method: &Method, extensions: &Extensions) -> bool {
+///
+/// Takes the method and extensions rather than a whole request, so it serves both the
+/// `Request` the hyper path has and the `Parts` the axum extractor is handed.
+pub(super) fn is_extended_connect(method: &Method, extensions: &Extensions) -> bool {
     method == Method::CONNECT
         && extensions
             .get::<Protocol>()
@@ -317,12 +315,12 @@ mod tests {
             .uri("https://example.com/")
             .body(())
             .unwrap();
-        assert!(!is_extended_connect(&tunnel));
+        assert!(!is_extended_connect(tunnel.method(), tunnel.extensions()));
 
         tunnel
             .extensions_mut()
             .insert(Protocol::from_static(WEBSOCKET_PROTOCOL));
-        assert!(is_extended_connect(&tunnel));
+        assert!(is_extended_connect(tunnel.method(), tunnel.extensions()));
     }
 
     #[test]
@@ -334,7 +332,7 @@ mod tests {
             .body(())
             .unwrap();
 
-        assert!(!is_extended_connect(&req));
+        assert!(!is_extended_connect(req.method(), req.extensions()));
     }
 
     #[test]
