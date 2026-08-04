@@ -872,74 +872,109 @@ where
         url: Url,
         io: S,
         options: Options,
-        mut builder: HttpRequestBuilder,
+        builder: HttpRequestBuilder,
     ) -> Result<WebSocket<S>> {
-        if !builder
-            .headers_ref()
-            .expect("header")
-            .contains_key(header::HOST)
-        {
-            let host = url.host().expect("hostname").to_string();
+        let (upgraded, negotiated) = http1_upgrade(url, io, options, builder).await?;
 
-            let is_port_defined = url.port().is_some();
-            let port = url.port_or_known_default().expect("port");
-            let host_header = if is_port_defined {
-                format!("{host}:{port}")
-            } else {
-                host
-            };
-
-            builder = builder.header(header::HOST, host_header.as_str());
-        }
-
-        let target_url = &url[url::Position::BeforePath..];
-
-        let mut req = builder
-            .method("GET")
-            .uri(target_url)
-            .header(header::UPGRADE, "websocket")
-            .header(header::CONNECTION, "upgrade")
-            .header(header::SEC_WEBSOCKET_KEY, generate_key())
-            .header(header::SEC_WEBSOCKET_VERSION, "13")
-            .body(Empty::<Bytes>::new())
-            .expect("request build");
-
-        if let Some(compression) = options.compression.as_ref() {
-            let extensions = WebSocketExtensions::from(compression);
-            let header_value = extensions.to_string().parse().unwrap();
-            req.headers_mut()
-                .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
-        }
-
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
-
-        #[cfg(not(feature = "smol"))]
-        tokio::spawn(async move {
-            if let Err(err) = conn.with_upgrades().await {
-                log::error!("upgrading connection: {:?}", err);
-            }
-        });
-
-        #[cfg(feature = "smol")]
-        smol::spawn(async move {
-            if let Err(err) = conn.with_upgrades().await {
-                log::error!("upgrading connection: {:?}", err);
-            }
-        })
-        .detach();
-
-        let mut response = sender.send_request(req).await?;
-        let negotiated = verify(&response, options)?;
-
-        let upgraded = hyper::upgrade::on(&mut response).await?;
-        let parts = upgraded.downcast::<TokioIo<S>>().unwrap();
-
-        // Extract the original stream and any leftover read buffer
+        // Recover the caller's own stream, along with anything the codec read past the
+        // end of the response.
+        let parts = upgraded
+            .downcast::<TokioIo<S>>()
+            .expect("downcast own stream");
         let stream = parts.io.into_inner();
-        let read_buf = parts.read_buf;
 
-        Ok(WebSocket::new(Role::Client, stream, read_buf, negotiated))
+        Ok(WebSocket::new(
+            Role::Client,
+            stream,
+            parts.read_buf,
+            negotiated,
+        ))
     }
+}
+
+/// Runs the RFC 6455 handshake and returns hyper's upgraded stream.
+///
+/// The two client entry points differ only in what they do with that stream:
+/// [`WebSocket::handshake_with_request`] downcasts it back to the caller's own type,
+/// while the version-selecting path keeps it as an [`HttpStream`] so both HTTP versions
+/// produce one type. Everything before that, defaulting the `Host` header, building the
+/// request, offering compression, driving the connection and checking the response, is
+/// the same work and lives here.
+async fn http1_upgrade<S>(
+    url: Url,
+    io: S,
+    options: Options,
+    mut builder: HttpRequestBuilder,
+) -> Result<(Upgraded, Negotiation)>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    if !builder
+        .headers_ref()
+        .expect("header")
+        .contains_key(header::HOST)
+    {
+        let host = url.host().expect("hostname").to_string();
+
+        let is_port_defined = url.port().is_some();
+        let port = url.port_or_known_default().expect("port");
+        let host_header = if is_port_defined {
+            format!("{host}:{port}")
+        } else {
+            host
+        };
+
+        builder = builder.header(header::HOST, host_header.as_str());
+    }
+
+    let target_url = &url[url::Position::BeforePath..];
+
+    let mut req = builder
+        .method("GET")
+        .uri(target_url)
+        .header(header::UPGRADE, "websocket")
+        .header(header::CONNECTION, "upgrade")
+        .header(header::SEC_WEBSOCKET_KEY, generate_key())
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .body(Empty::<Bytes>::new())
+        .expect("request build");
+
+    if let Some(compression) = options.compression.as_ref() {
+        let extensions = WebSocketExtensions::from(compression);
+        let header_value = extensions.to_string().parse().expect("extensions header");
+        req.headers_mut()
+            .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
+    }
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+
+    spawn_connection(async move {
+        if let Err(err) = conn.with_upgrades().await {
+            log::debug!("http1 connection closed: {err:?}");
+        }
+    });
+
+    let mut response = sender.send_request(req).await?;
+    let negotiated = verify(&response, options)?;
+
+    let upgraded = hyper::upgrade::on(&mut response).await?;
+
+    Ok((upgraded, negotiated))
+}
+
+/// Drives a hyper connection in the background on whichever runtime is enabled.
+///
+/// Every client handshake needs this, and picking `tokio::spawn` unconditionally would
+/// panic under the `smol` feature, where no tokio runtime is running.
+pub(crate) fn spawn_connection<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    #[cfg(not(feature = "smol"))]
+    tokio::spawn(fut);
+
+    #[cfg(feature = "smol")]
+    smol::spawn(fut).detach();
 }
 
 impl WebSocket<HttpStream> {
@@ -1040,12 +1075,7 @@ impl WebSocket<HttpStream> {
             return Err(WebSocketError::InvalidSecWebsocketVersion);
         }
 
-        let maybe_compression = request
-            .headers()
-            .get(header::SEC_WEBSOCKET_EXTENSIONS)
-            .and_then(|h| h.to_str().ok())
-            .map(WebSocketExtensions::from_str)
-            .and_then(std::result::Result::ok);
+        let maybe_compression = WebSocketExtensions::from_headers(request.headers());
 
         let mut response = Response::builder()
             .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
@@ -1058,22 +1088,15 @@ impl WebSocket<HttpStream> {
             .body(Empty::new())
             .expect("bug: failed to build response");
 
-        let extensions = if let Some(client_compression) = maybe_compression {
-            if let Some(server_compression) = options.compression.as_ref() {
-                let offer = server_compression.merge(&client_compression);
+        let extensions =
+            WebSocketExtensions::agree(options.compression.as_ref(), maybe_compression);
 
-                let header_value = offer.to_string().parse().unwrap();
-                response
-                    .headers_mut()
-                    .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
-
-                Some(offer)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        if let Some(offer) = extensions.as_ref() {
+            let header_value = offer.to_string().parse().expect("extensions header");
+            response
+                .headers_mut()
+                .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
+        }
 
         let stream = UpgradeFut {
             inner: hyper::upgrade::on(request),
@@ -1353,11 +1376,7 @@ fn verify_reqwest(response: &reqwest::Response, options: Options) -> Result<Nego
         return Err(WebSocketError::InvalidConnectionHeader);
     }
 
-    let extensions = headers
-        .get(reqwest::header::SEC_WEBSOCKET_EXTENSIONS)
-        .and_then(|h| h.to_str().ok())
-        .map(WebSocketExtensions::from_str)
-        .and_then(std::result::Result::ok);
+    let extensions = WebSocketExtensions::from_headers(headers);
 
     Negotiation::new(extensions, &options, Role::Client)
 }
@@ -1403,11 +1422,7 @@ fn verify(response: &Response<Incoming>, options: Options) -> Result<Negotiation
         return Err(WebSocketError::InvalidConnectionHeader);
     }
 
-    let extensions = headers
-        .get(header::SEC_WEBSOCKET_EXTENSIONS)
-        .and_then(|h| h.to_str().ok())
-        .map(WebSocketExtensions::from_str)
-        .and_then(std::result::Result::ok);
+    let extensions = WebSocketExtensions::from_headers(headers);
 
     Negotiation::new(extensions, &options, Role::Client)
 }
@@ -1469,8 +1484,8 @@ async fn connect_versioned(
 /// Runs the HTTP/1.1 handshake but keeps hyper's upgraded stream instead of downcasting.
 ///
 /// [`WebSocket::handshake_with_request`] recovers the original stream type so callers get
-/// their socket back. The versioned path cannot do that, since it has to produce the same
-/// type whichever HTTP version the handshake settles on.
+/// their socket back. The version-selecting path cannot do that, since it has to produce
+/// the same type whichever HTTP version the handshake settles on.
 #[cfg(feature = "http2")]
 async fn handshake_http1_upgraded<S>(
     url: Url,
@@ -1481,50 +1496,7 @@ async fn handshake_http1_upgraded<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let mut builder = builder;
-    if !builder
-        .headers_ref()
-        .expect("header")
-        .contains_key(header::HOST)
-    {
-        let host = url.host().expect("hostname").to_string();
-        let host_header = if url.port().is_some() {
-            format!("{host}:{}", url.port_or_known_default().expect("port"))
-        } else {
-            host
-        };
-        builder = builder.header(header::HOST, host_header.as_str());
-    }
-
-    let mut req = builder
-        .method("GET")
-        .uri(&url[url::Position::BeforePath..])
-        .header(header::UPGRADE, "websocket")
-        .header(header::CONNECTION, "upgrade")
-        .header(header::SEC_WEBSOCKET_KEY, generate_key())
-        .header(header::SEC_WEBSOCKET_VERSION, "13")
-        .body(Empty::<Bytes>::new())
-        .expect("request build");
-
-    if let Some(compression) = options.compression.as_ref() {
-        let extensions = WebSocketExtensions::from(compression);
-        let header_value = extensions.to_string().parse().expect("extensions header");
-        req.headers_mut()
-            .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
-    }
-
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
-
-    tokio::spawn(async move {
-        if let Err(err) = conn.with_upgrades().await {
-            log::debug!("http1 connection closed: {err:?}");
-        }
-    });
-
-    let mut response = sender.send_request(req).await?;
-    let negotiated = verify(&response, options)?;
-
-    let upgraded = hyper::upgrade::on(&mut response).await?;
+    let (upgraded, negotiated) = http1_upgrade(url, io, options, builder).await?;
 
     Ok(WebSocket::new(
         Role::Client,

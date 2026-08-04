@@ -23,8 +23,6 @@
 //!
 //! [`enable_connect_protocol`]: https://docs.rs/hyper/latest/hyper/server/conn/http2/struct.Builder.html#method.enable_connect_protocol
 
-use std::str::FromStr;
-
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::{
@@ -127,12 +125,7 @@ pub(super) fn verify<B>(response: &Response<B>, options: Options) -> Result<Nego
         ));
     }
 
-    let extensions = response
-        .headers()
-        .get(header::SEC_WEBSOCKET_EXTENSIONS)
-        .and_then(|h| h.to_str().ok())
-        .map(WebSocketExtensions::from_str)
-        .and_then(std::result::Result::ok);
+    let extensions = WebSocketExtensions::from_headers(response.headers());
 
     Negotiation::new(extensions, &options, Role::Client)
 }
@@ -162,7 +155,7 @@ where
     let (mut sender, conn) =
         hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await?;
 
-    tokio::spawn(async move {
+    super::spawn_connection(async move {
         if let Err(err) = conn.await {
             log::debug!("http2 connection closed: {err:?}");
         }
@@ -227,29 +220,21 @@ pub(super) fn upgrade<B>(request: &mut Request<B>, options: Options) -> UpgradeR
         return Err(WebSocketError::InvalidSecWebsocketVersion);
     }
 
-    let client_extensions = request
-        .headers()
-        .get(header::SEC_WEBSOCKET_EXTENSIONS)
-        .and_then(|h| h.to_str().ok())
-        .map(WebSocketExtensions::from_str)
-        .and_then(std::result::Result::ok);
+    let client_extensions = WebSocketExtensions::from_headers(request.headers());
 
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .body(Empty::new())
         .expect("bug: failed to build response");
 
-    let extensions = match (client_extensions, options.compression.as_ref()) {
-        (Some(client_offer), Some(server_offer)) => {
-            let offer = server_offer.merge(&client_offer);
-            let header_value = offer.to_string().parse().expect("extensions header");
-            response
-                .headers_mut()
-                .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
-            Some(offer)
-        }
-        _ => None,
-    };
+    let extensions = WebSocketExtensions::agree(options.compression.as_ref(), client_extensions);
+
+    if let Some(offer) = extensions.as_ref() {
+        let header_value = offer.to_string().parse().expect("extensions header");
+        response
+            .headers_mut()
+            .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
+    }
 
     let fut = UpgradeFut {
         inner: hyper::upgrade::on(request),

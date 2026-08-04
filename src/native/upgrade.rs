@@ -19,7 +19,6 @@ use {
     crate::{compression::WebSocketExtensions, Result},
     http_body_util::Empty,
     hyper::{header, Response},
-    std::future::Future,
 };
 
 /// Represents an incoming WebSocket upgrade request that can be converted into a WebSocket connection.
@@ -143,13 +142,11 @@ impl IncomingUpgrade {
             None => Response::builder().status(hyper::StatusCode::OK),
         };
 
-        let (builder, extensions) = match (self.extensions, options.compression.as_ref()) {
-            (Some(client_offer), Some(server_offer)) => {
-                let offer = server_offer.merge(&client_offer);
-                let response = builder.header(header::SEC_WEBSOCKET_EXTENSIONS, offer.to_string());
-                (response, Some(offer))
-            }
-            _ => (builder, None),
+        let extensions = WebSocketExtensions::agree(options.compression.as_ref(), self.extensions);
+
+        let builder = match extensions.as_ref() {
+            Some(offer) => builder.header(header::SEC_WEBSOCKET_EXTENSIONS, offer.to_string()),
+            None => builder,
         };
 
         let response = builder
@@ -205,57 +202,48 @@ where
     /// - The protocol version (must be 13)
     /// - Any extension offers from the client
     /// - The upgrade future from Hyper
-    fn from_request_parts(
+    async fn from_request_parts(
         parts: &mut http::request::Parts,
         _state: &S,
-    ) -> impl Future<Output = std::result::Result<Self, Self::Rejection>> + Send {
-        use std::str::FromStr;
+    ) -> std::result::Result<Self, Self::Rejection> {
+        // RFC 8441 drops the key exchange, so only the HTTP/1.1 handshake requires one.
+        #[cfg(feature = "http2")]
+        let is_extended_connect =
+            super::http2::is_websocket_connect(&parts.method, &parts.extensions);
+        #[cfg(not(feature = "http2"))]
+        let is_extended_connect = false;
 
-        async move {
-            // RFC 8441 drops the key exchange, so only the HTTP/1.1 handshake requires one.
-            #[cfg(feature = "http2")]
-            let is_extended_connect =
-                super::http2::is_websocket_connect(&parts.method, &parts.extensions);
-            #[cfg(not(feature = "http2"))]
-            let is_extended_connect = false;
-
-            let key = if is_extended_connect {
-                None
-            } else {
-                let key = parts
-                    .headers
-                    .get(header::SEC_WEBSOCKET_KEY)
-                    .ok_or(http::StatusCode::BAD_REQUEST)?;
-                Some(sec_websocket_protocol(key.as_bytes()))
-            };
-
-            if parts
+        let key = if is_extended_connect {
+            None
+        } else {
+            let key = parts
                 .headers
-                .get(header::SEC_WEBSOCKET_VERSION)
-                .map(|v| v.as_bytes())
-                != Some(b"13")
-            {
-                return Err(hyper::StatusCode::BAD_REQUEST);
-            }
+                .get(header::SEC_WEBSOCKET_KEY)
+                .ok_or(http::StatusCode::BAD_REQUEST)?;
+            Some(sec_websocket_protocol(key.as_bytes()))
+        };
 
-            let extensions = parts
-                .headers
-                .get(header::SEC_WEBSOCKET_EXTENSIONS)
-                .and_then(|h| h.to_str().ok())
-                .map(WebSocketExtensions::from_str)
-                .and_then(std::result::Result::ok);
-
-            let on_upgrade = parts
-                .extensions
-                .remove::<hyper::upgrade::OnUpgrade>()
-                .ok_or(hyper::StatusCode::BAD_REQUEST)?;
-
-            Ok(Self {
-                on_upgrade,
-                extensions,
-                key,
-            })
+        if parts
+            .headers
+            .get(header::SEC_WEBSOCKET_VERSION)
+            .map(|v| v.as_bytes())
+            != Some(b"13")
+        {
+            return Err(hyper::StatusCode::BAD_REQUEST);
         }
+
+        let extensions = WebSocketExtensions::from_headers(&parts.headers);
+
+        let on_upgrade = parts
+            .extensions
+            .remove::<hyper::upgrade::OnUpgrade>()
+            .ok_or(hyper::StatusCode::BAD_REQUEST)?;
+
+        Ok(Self {
+            on_upgrade,
+            extensions,
+            key,
+        })
     }
 }
 

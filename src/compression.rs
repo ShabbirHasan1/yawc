@@ -34,6 +34,38 @@ pub struct WebSocketExtensions {
     pub(super) client_no_context_takeover: bool,
 }
 
+impl WebSocketExtensions {
+    /// Reads the `Sec-WebSocket-Extensions` header out of a handshake message.
+    ///
+    /// A missing header and one that fails to parse are both treated as "nothing
+    /// negotiated": the peer offered nothing this side can act on, and the connection
+    /// proceeds without extensions rather than failing. Every handshake path, client and
+    /// server, HTTP/1.1 and HTTP/2, reads the header this way.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn from_headers(headers: &hyper::HeaderMap) -> Option<Self> {
+        use std::str::FromStr;
+
+        headers
+            .get(hyper::header::SEC_WEBSOCKET_EXTENSIONS)
+            .and_then(|value| value.to_str().ok())
+            .map(Self::from_str)
+            .and_then(std::result::Result::ok)
+    }
+
+    /// Resolves what a server should answer with, given what the client offered.
+    ///
+    /// Compression is only negotiated when both sides want it: a client that offered
+    /// nothing gets nothing, and a server with compression disabled ignores whatever was
+    /// offered. Otherwise the two are merged into the terms both can honor.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn agree(server: Option<&DeflateOptions>, client: Option<Self>) -> Option<Self> {
+        match (server, client) {
+            (Some(server), Some(client)) => Some(server.merge(&client)),
+            _ => None,
+        }
+    }
+}
+
 impl<'a> From<&'a DeflateOptions> for WebSocketExtensions {
     /// Converts [`DeflateOptions`] into `WebSocketExtensions`, configuring the extensions
     /// for negotiation based on the specified compression settings.
