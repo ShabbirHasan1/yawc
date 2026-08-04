@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     CONNECT and take the HTTP/2 path, so one handler serves both versions. The hyper
     HTTP/2 server builder must have `enable_connect_protocol()` set.
   - The axum `IncomingUpgrade` extractor accepts both handshakes.
-  - New errors `ExtendedConnectNotSupported` and `MissingConnectProtocol`.
+  - New error `ExtendedConnectNotSupported`.
   - See the `http2_client` and `http2_server` examples.
 
 - **New `WebSocket::from_stream` and `WebSocket::from_stream_with_extensions`**: Wrap a

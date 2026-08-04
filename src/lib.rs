@@ -242,11 +242,6 @@ pub enum WebSocketError {
     #[cfg(all(feature = "http2", not(target_arch = "wasm32")))]
     ExtendedConnectNotSupported,
 
-    /// A CONNECT request arrived without `:protocol = websocket`.
-    #[error("CONNECT request is missing the websocket protocol pseudo-header")]
-    #[cfg(all(feature = "http2", not(target_arch = "wasm32")))]
-    MissingConnectProtocol,
-
     /// Received compressed frame but compression not negotiated.
     #[error("Received compressed frame on stream that doesn't support compression")]
     #[cfg(not(target_arch = "wasm32"))]
@@ -300,10 +295,7 @@ impl WebSocketError {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn is_handshake_error(&self) -> bool {
         #[cfg(feature = "http2")]
-        if matches!(
-            self,
-            Self::ExtendedConnectNotSupported | Self::MissingConnectProtocol
-        ) {
+        if matches!(self, Self::ExtendedConnectNotSupported) {
             return true;
         }
 

@@ -33,10 +33,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite};
 use url::Url;
 
-use super::{
-    HttpRequestBuilder, HttpStream, HttpWebSocket, Negotiation, Options, Role, UpgradeFut,
-    UpgradeResult,
-};
+use super::{HttpRequestBuilder, HttpStream, HttpWebSocket, Negotiation, Options, Role};
 use crate::{compression::WebSocketExtensions, Result, WebSocketError};
 
 /// The value of the `:protocol` pseudo-header identifying a WebSocket stream.
@@ -199,51 +196,6 @@ fn connect_error(err: hyper::Error) -> WebSocketError {
     WebSocketError::from(err)
 }
 
-/// Accepts an RFC 8441 extended CONNECT request and produces the handshake response.
-///
-/// Called by [`WebSocket::upgrade_with_options`] when the request is an extended CONNECT,
-/// so server code does not normally reach for this directly.
-///
-/// [`WebSocket::upgrade_with_options`]: super::WebSocket::upgrade_with_options
-pub(super) fn upgrade<B>(request: &mut Request<B>, options: Options) -> UpgradeResult {
-    if !is_extended_connect(request) {
-        return Err(WebSocketError::MissingConnectProtocol);
-    }
-
-    // RFC 8441 keeps the version negotiation but drops the key exchange.
-    if request
-        .headers()
-        .get(header::SEC_WEBSOCKET_VERSION)
-        .map(|v| v.as_bytes())
-        != Some(b"13")
-    {
-        return Err(WebSocketError::InvalidSecWebsocketVersion);
-    }
-
-    let client_extensions = WebSocketExtensions::from_headers(request.headers());
-
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .body(Empty::new())
-        .expect("bug: failed to build response");
-
-    let extensions = WebSocketExtensions::agree(options.compression.as_ref(), client_extensions);
-
-    if let Some(offer) = extensions.as_ref() {
-        let header_value = offer.to_string().parse().expect("extensions header");
-        response
-            .headers_mut()
-            .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
-    }
-
-    let fut = UpgradeFut {
-        inner: hyper::upgrade::on(request),
-        negotiation: Some(Negotiation::new(extensions, &options, Role::Server)?),
-    };
-
-    Ok((response, fut))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,7 +348,7 @@ mod tests {
         req.extensions_mut()
             .insert(Protocol::from_static(WEBSOCKET_PROTOCOL));
 
-        let err = upgrade(&mut req, Options::default()).unwrap_err();
+        let err = crate::WebSocket::upgrade_with_options(&mut req, Options::default()).unwrap_err();
         assert!(matches!(err, WebSocketError::InvalidSecWebsocketVersion));
     }
 
@@ -411,7 +363,8 @@ mod tests {
         req.extensions_mut()
             .insert(Protocol::from_static(WEBSOCKET_PROTOCOL));
 
-        let (response, _fut) = upgrade(&mut req, Options::default()).unwrap();
+        let (response, _fut) =
+            crate::WebSocket::upgrade_with_options(&mut req, Options::default()).unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response
@@ -434,8 +387,11 @@ mod tests {
         req.extensions_mut()
             .insert(Protocol::from_static(WEBSOCKET_PROTOCOL));
 
-        let (response, _fut) =
-            upgrade(&mut req, Options::default().with_balanced_compression()).unwrap();
+        let (response, _fut) = crate::WebSocket::upgrade_with_options(
+            &mut req,
+            Options::default().with_balanced_compression(),
+        )
+        .unwrap();
 
         let agreed = response
             .headers()

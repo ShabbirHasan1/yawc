@@ -1056,15 +1056,8 @@ impl WebSocket<HttpStream> {
     ) -> UpgradeResult {
         let request = request.borrow_mut();
 
-        #[cfg(feature = "http2")]
-        if http2::is_extended_connect(request) {
-            return http2::upgrade(request, options);
-        }
-
-        let key = request
-            .headers()
-            .get(header::SEC_WEBSOCKET_KEY)
-            .ok_or(WebSocketError::MissingSecWebSocketKey)?;
+        // Only the opening line of the response depends on which handshake was used.
+        let builder = Self::handshake_response(request)?;
 
         if request
             .headers()
@@ -1075,28 +1068,18 @@ impl WebSocket<HttpStream> {
             return Err(WebSocketError::InvalidSecWebsocketVersion);
         }
 
-        let maybe_compression = WebSocketExtensions::from_headers(request.headers());
+        let client_extensions = WebSocketExtensions::from_headers(request.headers());
+        let extensions =
+            WebSocketExtensions::agree(options.compression.as_ref(), client_extensions);
 
-        let mut response = Response::builder()
-            .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
-            .header(hyper::header::CONNECTION, "upgrade")
-            .header(hyper::header::UPGRADE, "websocket")
-            .header(
-                header::SEC_WEBSOCKET_ACCEPT,
-                upgrade::sec_websocket_protocol(key.as_bytes()),
-            )
+        let builder = match extensions.as_ref() {
+            Some(offer) => builder.header(header::SEC_WEBSOCKET_EXTENSIONS, offer.to_string()),
+            None => builder,
+        };
+
+        let response = builder
             .body(Empty::new())
             .expect("bug: failed to build response");
-
-        let extensions =
-            WebSocketExtensions::agree(options.compression.as_ref(), maybe_compression);
-
-        if let Some(offer) = extensions.as_ref() {
-            let header_value = offer.to_string().parse().expect("extensions header");
-            response
-                .headers_mut()
-                .insert(header::SEC_WEBSOCKET_EXTENSIONS, header_value);
-        }
 
         let stream = UpgradeFut {
             inner: hyper::upgrade::on(request),
@@ -1104,6 +1087,32 @@ impl WebSocket<HttpStream> {
         };
 
         Ok((response, stream))
+    }
+
+    /// Starts the handshake response for whichever handshake the request used.
+    ///
+    /// This is the whole difference between the two on the server: RFC 8441 answers `200`
+    /// and has no key to echo, RFC 6455 answers `101` and must echo one. What follows,
+    /// the version check and extension negotiation, is the same either way.
+    fn handshake_response<B>(request: &Request<B>) -> Result<hyper::http::response::Builder> {
+        #[cfg(feature = "http2")]
+        if http2::is_extended_connect(request) {
+            return Ok(Response::builder().status(StatusCode::OK));
+        }
+
+        let key = request
+            .headers()
+            .get(header::SEC_WEBSOCKET_KEY)
+            .ok_or(WebSocketError::MissingSecWebSocketKey)?;
+
+        Ok(Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(header::CONNECTION, "upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header(
+                header::SEC_WEBSOCKET_ACCEPT,
+                upgrade::sec_websocket_protocol(key.as_bytes()),
+            ))
     }
 }
 
