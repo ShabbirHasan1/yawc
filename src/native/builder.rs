@@ -64,9 +64,17 @@ pub type HttpRequestBuilder = hyper::http::request::Builder;
 ///     todo!()
 /// }
 /// ```
-pub struct WebSocketBuilder {
+/// The `S` parameter is the stream the finished connection runs on, and it defaults to
+/// the plain or TLS socket that [`WebSocket::connect`] produces, so `WebSocketBuilder`
+/// keeps meaning what it always did.
+///
+/// Only [`http_version`](Self::http_version) changes it, to
+/// [`HttpStream`](super::HttpStream): an HTTP/2 WebSocket lives on one stream of a
+/// multiplexed connection, so there is no socket to hand back. The builder methods are
+/// shared, and only the `Future` impls differ.
+pub struct WebSocketBuilder<S = MaybeTlsStream<TcpStream>> {
     pub(super) opts: Option<WsBuilderOpts>,
-    pub(super) future: Option<BoxFuture<'static, Result<WebSocket<MaybeTlsStream<TcpStream>>>>>,
+    pub(super) future: Option<BoxFuture<'static, Result<WebSocket<S>>>>,
 }
 
 /// Internal options structure for WebSocketBuilder.
@@ -79,9 +87,11 @@ pub(super) struct WsBuilderOpts {
     pub(super) connector: Option<TlsConnector>,
     pub(super) establish_options: Option<Options>,
     pub(super) http_builder: Option<HttpRequestBuilder>,
+    #[cfg(feature = "http2")]
+    pub(super) version: HttpVersion,
 }
 
-impl WebSocketBuilder {
+impl<S> WebSocketBuilder<S> {
     /// Creates a new WebSocketBuilder with the specified URL.
     ///
     /// Initializes a builder with default settings that can be customized
@@ -97,6 +107,8 @@ impl WebSocketBuilder {
                 connector: None,
                 establish_options: None,
                 http_builder: None,
+                #[cfg(feature = "http2")]
+                version: HttpVersion::Http1,
             }),
             future: None,
         }
@@ -192,6 +204,138 @@ impl WebSocketBuilder {
         };
         opts.http_builder = Some(builder);
         self
+    }
+}
+
+#[cfg(feature = "http2")]
+impl WebSocketBuilder {
+    /// Selects the HTTP version used for the handshake.
+    ///
+    /// Reaching for this switches the connection to the RFC 8441 machinery and changes
+    /// what the builder resolves to: [`HttpWebSocket`](super::HttpWebSocket) instead of
+    /// [`TcpWebSocket`](super::TcpWebSocket). An HTTP/2 WebSocket lives on one stream of
+    /// a multiplexed connection, so there is no underlying socket to hand back.
+    ///
+    /// Leaving this alone keeps the HTTP/1.1 handshake and the existing return type,
+    /// which is what almost every peer wants: RFC 8441 support is rare enough that
+    /// HTTP/2 is worth asking for only when the server is known to implement it.
+    ///
+    /// Every other builder method is available before or after this call.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use yawc::{HttpVersion, WebSocket};
+    ///
+    /// # async fn example() -> yawc::Result<()> {
+    /// let ws = WebSocket::connect("wss://example.com/chat".parse()?)
+    ///     .http_version(HttpVersion::Http2)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+    pub fn http_version(mut self, version: HttpVersion) -> WebSocketBuilder<super::HttpStream> {
+        let Some(mut opts) = self.opts.take() else {
+            unreachable!()
+        };
+        opts.version = version;
+
+        WebSocketBuilder {
+            opts: Some(opts),
+            future: None,
+        }
+    }
+}
+
+/// The HTTP version used to carry a WebSocket connection.
+///
+/// HTTP/1.1 uses the RFC 6455 `Upgrade` handshake. HTTP/2 uses the RFC 8441 extended
+/// CONNECT handshake, which puts the connection on a single stream of a multiplexed
+/// HTTP/2 connection.
+#[cfg(feature = "http2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpVersion {
+    /// Always use the HTTP/1.1 `Upgrade` handshake.
+    #[default]
+    Http1,
+
+    /// Use the HTTP/2 extended CONNECT handshake.
+    ///
+    /// Over `wss://` this offers only the `h2` ALPN protocol, so a server that cannot
+    /// speak HTTP/2 fails the TLS handshake rather than silently falling back. Over
+    /// `ws://` it assumes HTTP/2 prior knowledge, which only works against a server
+    /// configured to expect it.
+    ///
+    /// This is an explicit choice because RFC 8441 support is rare: negotiating `h2` only
+    /// means the peer speaks HTTP/2, and most deployments serve `h2` for ordinary
+    /// requests while accepting WebSockets over HTTP/1.1 only. Against such a peer this
+    /// fails rather than downgrading, so use it when the server is known to implement
+    /// RFC 8441. Everything else should stay on the default HTTP/1.1 handshake.
+    ///
+    /// # Trying HTTP/2 first
+    ///
+    /// There is no built-in negotiation, because ALPN cannot answer whether the peer
+    /// implements RFC 8441 and guessing wrong costs a wasted connection. A caller who
+    /// wants to try anyway can ask for it and fall back:
+    ///
+    /// ```no_run
+    /// use yawc::{HttpVersion, WebSocket};
+    ///
+    /// # async fn example(url: url::Url) -> yawc::Result<()> {
+    /// let ws = match WebSocket::connect(url.clone())
+    ///     .http_version(HttpVersion::Http2)
+    ///     .await
+    /// {
+    ///     Ok(ws) => ws,
+    ///     // The peer answered, but not with a WebSocket. Nothing on this connection is
+    ///     // salvageable, and ALPN has already committed it to HTTP/2, so the retry has
+    ///     // to dial again.
+    ///     Err(err) if err.is_handshake_error() => {
+    ///         WebSocket::connect(url)
+    ///             .http_version(HttpVersion::Http1)
+    ///             .await?
+    ///     }
+    ///     Err(err) => return Err(err),
+    /// };
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Written out this way the cost is visible: against a peer without RFC 8441, which
+    /// is most of them, every connection pays a full TCP and TLS handshake before the
+    /// one that works. Worth it when the peer is genuinely unknown, not when it is not.
+    Http2,
+}
+
+#[cfg(feature = "http2")]
+impl Future for WebSocketBuilder<super::HttpStream> {
+    type Output = Result<super::HttpWebSocket>;
+
+    /// Polls the future to establish the WebSocket connection.
+    ///
+    /// Mirrors the default builder's poll, but resolves to an
+    /// [`HttpWebSocket`](super::HttpWebSocket): the HTTP/2 handshake hands back a stream
+    /// of a multiplexed connection rather than the socket underneath it.
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Some(opts) = this.opts.take() {
+            let future = super::connect_versioned(
+                opts.url,
+                opts.tcp_address,
+                opts.connector,
+                opts.establish_options.unwrap_or_default(),
+                opts.http_builder.unwrap_or_else(HttpRequest::builder),
+                opts.version,
+            );
+            this.future = Some(Box::pin(future));
+        }
+
+        let Some(pinned) = &mut this.future else {
+            unreachable!()
+        };
+        pinned.poll_unpin(cx)
     }
 }
 

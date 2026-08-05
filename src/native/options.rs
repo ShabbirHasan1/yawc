@@ -700,7 +700,7 @@ impl DeflateOptions {
     }
 
     /// Called by the server when upgrading.
-    pub(super) fn merge(&self, offered: &WebSocketExtensions) -> WebSocketExtensions {
+    pub(crate) fn merge(&self, offered: &WebSocketExtensions) -> WebSocketExtensions {
         WebSocketExtensions {
             // Accept client's no_context_takeover settings
             client_no_context_takeover: offered.client_no_context_takeover

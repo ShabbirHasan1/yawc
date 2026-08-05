@@ -97,6 +97,21 @@ else
 fi
 '''
 
+[tasks.test-axum]
+description = "Run the test suite with axum and zlib, without http2 (nextest if available)"
+# Matches how the autobahn suite builds the server, so the axum extractor is covered
+# with the extended-CONNECT branch compiled out.
+env = { "YAWC_TEST_FEATURES" = "--features axum,zlib", "YAWC_TEST_DOC" = "0" }
+run_task = "test-runner"
+
+[tasks.test-http2]
+description = "Run the test suite with the http2 and axum features (nextest if available)"
+# Doc tests run in `test` above. This adds the RFC 8441 unit and integration
+# tests, which are compiled out without the feature. axum comes along because the
+# extractor test needs both features to compile.
+env = { "YAWC_TEST_FEATURES" = "--features http2,axum", "YAWC_TEST_DOC" = "0" }
+run_task = "test-runner"
+
 [tasks.wasm]
 description = "Run the wasm tests in headless chrome and node"
 script_runner = "@shell"
@@ -150,6 +165,8 @@ dependencies = [
     "build",
     "test",
     "test-zlib",
+    "test-axum",
+    "test-http2",
     "doc",
     "wasm",
     "autobahn-client",
