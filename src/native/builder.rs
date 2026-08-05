@@ -273,6 +273,39 @@ pub enum HttpVersion {
     /// requests while accepting WebSockets over HTTP/1.1 only. Against such a peer this
     /// fails rather than downgrading, so use it when the server is known to implement
     /// RFC 8441. Everything else should stay on the default HTTP/1.1 handshake.
+    ///
+    /// # Trying HTTP/2 first
+    ///
+    /// There is no built-in negotiation, because ALPN cannot answer whether the peer
+    /// implements RFC 8441 and guessing wrong costs a wasted connection. A caller who
+    /// wants to try anyway can ask for it and fall back:
+    ///
+    /// ```no_run
+    /// use yawc::{HttpVersion, WebSocket};
+    ///
+    /// # async fn example(url: url::Url) -> yawc::Result<()> {
+    /// let ws = match WebSocket::connect(url.clone())
+    ///     .http_version(HttpVersion::Http2)
+    ///     .await
+    /// {
+    ///     Ok(ws) => ws,
+    ///     // The peer answered, but not with a WebSocket. Nothing on this connection is
+    ///     // salvageable, and ALPN has already committed it to HTTP/2, so the retry has
+    ///     // to dial again.
+    ///     Err(err) if err.is_handshake_error() => {
+    ///         WebSocket::connect(url)
+    ///             .http_version(HttpVersion::Http1)
+    ///             .await?
+    ///     }
+    ///     Err(err) => return Err(err),
+    /// };
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Written out this way the cost is visible: against a peer without RFC 8441, which
+    /// is most of them, every connection pays a full TCP and TLS handshake before the
+    /// one that works. Worth it when the peer is genuinely unknown, not when it is not.
     Http2,
 }
 

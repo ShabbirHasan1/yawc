@@ -97,7 +97,8 @@
 //! peer speaks HTTP/2, not that it implements RFC 8441, and most deployments serve `h2`
 //! for ordinary requests while accepting WebSockets over HTTP/1.1 only. Choosing HTTP/2
 //! against such a peer fails rather than silently downgrading, so the choice stays with
-//! the caller who knows what the server does.
+//! the caller who knows what the server does. To try HTTP/2 and fall back, see
+//! [`HttpVersion::Http2`].
 //!
 //! On the server, [`WebSocket::upgrade`] handles both handshakes already. The one extra
 //! step is calling `enable_connect_protocol()` on hyper's HTTP/2 server builder, which is
