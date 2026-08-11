@@ -1,5 +1,5 @@
 use futures::{
-    channel::mpsc::{channel, unbounded, Receiver, UnboundedReceiver, UnboundedSender},
+    channel::mpsc::{unbounded, UnboundedReceiver},
     stream::StreamExt,
 };
 use std::{
@@ -9,21 +9,31 @@ use std::{
 };
 use url::Url;
 use wasm_bindgen::prelude::*;
-use web_sys::MessageEvent;
+use web_sys::{CloseEvent, Event, MessageEvent};
 
 use crate::{
     frame::{Frame, OpCode},
     Result, WebSocketError,
 };
 
+/// Every handler is registered as an `Event` listener so they can all be stored together.
+/// `MessageEvent` and `CloseEvent` derive from `Event`, so the handlers that need the
+/// richer type cast back to it; the registration they are attached to guarantees the cast.
+type EventClosure = Closure<dyn FnMut(Event)>;
+
 /// A WebSocket wrapper for WASM applications that provides an async interface
 /// for WebSocket communication. This implementation wraps the browser's native
 /// WebSocket API and provides Rust-friendly methods for sending and receiving messages.
+///
+/// Dropping the `WebSocket` unregisters the event handlers and closes the underlying
+/// browser socket.
 pub struct WebSocket {
     /// The underlying browser WebSocket instance
     stream: web_sys::WebSocket,
     /// Channel receiver for incoming messages and errors
     receiver: UnboundedReceiver<Result<Frame>>,
+    /// Event handlers, kept alive for as long as the socket is and freed with it.
+    _handlers: [EventClosure; 4],
 }
 
 impl WebSocket {
@@ -43,104 +53,99 @@ impl WebSocket {
     /// let websocket = WebSocket::connect("wss://example.com/socket").await?;
     /// ```
     pub async fn connect(url: Url) -> Result<Self> {
-        // Initialize the WebSocket connection
+        let (socket, mut outcome) = Self::open(&url)?;
+
+        // `open`, `error` and `close` all feed `outcome`, and per WHATWG's "fail the
+        // WebSocket connection" a failed handshake always fires `error` then `close`, so
+        // one of the three is guaranteed to arrive.
+        match outcome.next().await {
+            Some(Ok(())) => Ok(socket),
+            // Dropping `socket` unregisters the handlers and closes the browser socket.
+            _ => Err(WebSocketError::ConnectionClosed),
+        }
+    }
+
+    /// Creates the browser socket, registers every event handler on it, and returns the
+    /// socket alongside the channel reporting how the handshake ended.
+    ///
+    /// Kept out of `connect` so the handler locals stay out of that future's layout.
+    fn open(url: &Url) -> Result<(Self, UnboundedReceiver<Result<()>>)> {
         let stream = web_sys::WebSocket::new(url.as_str()).map_err(WebSocketError::Js)?;
         // Set the binary type to be arraybuffers so that we can wrap them in `Bytes`
         stream.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
-        // Create a communication channel
+        // Frames and errors delivered to the caller once connected.
         let (tx, rx) = unbounded();
+        // How the handshake ended. Cloneable senders let the three handlers share it
+        // without wrapping a oneshot in an `Rc<RefCell<_>>`.
+        let (outcome_tx, outcome_rx) = unbounded();
 
-        // Set up the event handlers
-        Self::setup_message_handler(&stream, tx.clone());
-        Self::setup_close_handler(&stream, tx);
+        let onopen = {
+            let outcome_tx = outcome_tx.clone();
+            EventClosure::new(move |_: Event| {
+                let _ = outcome_tx.unbounded_send(Ok(()));
+            })
+        };
 
-        // Wait for the connection to open
-        let mut open_future = Self::setup_open_handler(&stream);
-        let _ = open_future.next().await;
+        let onerror = {
+            let outcome_tx = outcome_tx.clone();
+            // The event carries no detail by design, so it only has to unblock `connect`.
+            EventClosure::new(move |_: Event| {
+                let _ = outcome_tx.unbounded_send(Err(WebSocketError::ConnectionClosed));
+            })
+        };
 
-        Ok(Self {
+        let onmessage = {
+            let tx = tx.clone();
+            EventClosure::new(move |event: Event| {
+                let data = event.unchecked_into::<MessageEvent>().data();
+                let maybe_fv = if data.has_type::<js_sys::JsString>() {
+                    let str_value = data.unchecked_into::<js_sys::JsString>();
+                    Some(Frame::text(String::from(str_value)))
+                } else if data.has_type::<js_sys::ArrayBuffer>() {
+                    let buffer_value =
+                        js_sys::Uint8Array::new(&data.unchecked_into::<js_sys::ArrayBuffer>())
+                            .to_vec();
+                    Some(Frame::binary(buffer_value))
+                } else {
+                    None
+                };
+
+                if let Some(fv) = maybe_fv {
+                    // ignore the error, it could be that the other end closed the
+                    // connection and we don't want to panic
+                    let _ = tx.unbounded_send(Ok(fv));
+                }
+            })
+        };
+
+        let onclose = EventClosure::new(move |event: Event| {
+            let close_event = event.unchecked_into::<CloseEvent>();
+            if !close_event.was_clean() {
+                web_sys::console::warn_1(
+                    &js_sys::JsString::from_str("WebSocket CloseEvent wasClean() == false")
+                        .unwrap(), // SAFETY: This always succeeds
+                );
+            }
+            let close_frame = Frame::close(close_event.code().into(), close_event.reason());
+            let _ = tx.unbounded_send(Ok(close_frame));
+            let _ = tx.unbounded_send(Err(WebSocketError::ConnectionClosed));
+            // A close before the handshake completed is a failed connect.
+            let _ = outcome_tx.unbounded_send(Err(WebSocketError::ConnectionClosed));
+        });
+
+        stream.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+        stream.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+        stream.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        stream.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+
+        let socket = Self {
             stream,
             receiver: rx,
-        })
-    }
+            _handlers: [onopen, onerror, onmessage, onclose],
+        };
 
-    /// Sets up the close handler for the WebSocket
-    ///
-    /// # Arguments
-    ///
-    /// * `stream` - Reference to the WebSocket instance
-    /// * `tx` - Channel sender to forward close events
-    fn setup_close_handler(stream: &web_sys::WebSocket, tx: UnboundedSender<Result<Frame>>) {
-        let onclose_callback: Closure<dyn Fn(web_sys::CloseEvent)> =
-            Closure::new(move |close_event: web_sys::CloseEvent| {
-                if !close_event.was_clean() {
-                    web_sys::console::warn_1(
-                        &js_sys::JsString::from_str("WebSocket CloseEvent wasClean() == false")
-                            .unwrap(), // SAFETY: This always succeeds
-                    );
-                }
-                let close_frame = Frame::close(close_event.code().into(), close_event.reason());
-                let _ = tx.unbounded_send(Ok(close_frame));
-                let _ = tx.unbounded_send(Err(WebSocketError::ConnectionClosed));
-            });
-
-        stream.set_onclose(Some(onclose_callback.as_ref().unchecked_ref()));
-        onclose_callback.forget();
-    }
-
-    /// Sets up the open handler for the WebSocket and returns a future that resolves
-    /// when the connection is established
-    ///
-    /// # Arguments
-    ///
-    /// * `stream` - Reference to the WebSocket instance
-    ///
-    /// # Returns
-    ///
-    /// A future that resolves when the connection is opened
-    fn setup_open_handler(stream: &web_sys::WebSocket) -> Receiver<()> {
-        let (mut open_tx, open_rx) = channel(1);
-
-        let onopen_callback = Closure::<dyn FnMut(_)>::new(move |_: MessageEvent| {
-            let _ = open_tx.try_send(());
-        });
-
-        stream.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
-        onopen_callback.forget();
-
-        open_rx
-    }
-
-    /// Sets up the message handler for the WebSocket
-    ///
-    /// # Arguments
-    ///
-    /// * `stream` - Reference to the WebSocket instance
-    /// * `tx` - Channel sender to forward received messages
-    fn setup_message_handler(stream: &web_sys::WebSocket, tx: UnboundedSender<Result<Frame>>) {
-        let onmessage_callback: Closure<dyn Fn(_)> = Closure::new(move |e: MessageEvent| {
-            let data = e.data();
-            let maybe_fv = if data.has_type::<js_sys::JsString>() {
-                let str_value = data.unchecked_into::<js_sys::JsString>();
-                Some(Frame::text(String::from(str_value)))
-            } else if data.has_type::<js_sys::ArrayBuffer>() {
-                let buffer_value =
-                    js_sys::Uint8Array::new(&data.unchecked_into::<js_sys::ArrayBuffer>()).to_vec();
-                Some(Frame::binary(buffer_value))
-            } else {
-                None
-            };
-
-            if let Some(fv) = maybe_fv {
-                // ignore the error, it could be that the other end closed the
-                // connection and we don't want to panic
-                let _ = tx.unbounded_send(Ok(fv));
-            }
-        });
-
-        stream.set_onmessage(Some(onmessage_callback.as_ref().unchecked_ref()));
-        onmessage_callback.forget();
+        Ok((socket, outcome_rx))
     }
 
     /// Receive the next frame from the websocket
@@ -157,6 +162,20 @@ impl WebSocket {
             Some(res) => res,
             None => Err(WebSocketError::ConnectionClosed),
         }
+    }
+}
+
+impl Drop for WebSocket {
+    fn drop(&mut self) {
+        // Unregister first: close() fires its event asynchronously, and by then the
+        // handlers that would receive it are gone along with the channels they send to.
+        self.stream.set_onopen(None);
+        self.stream.set_onerror(None);
+        self.stream.set_onmessage(None);
+        self.stream.set_onclose(None);
+        // A no-op on an already-closed socket, and aborts the handshake on a connecting
+        // one, so no `ready_state` check is needed.
+        let _ = self.stream.close();
     }
 }
 
@@ -220,5 +239,19 @@ impl futures::Stream for WebSocket {
             }
             None => Poll::Ready(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handshake that cannot succeed has to resolve, not hang. Before `onerror` and
+    /// `onclose` fed the outcome channel, this future stayed `Pending` forever and the
+    /// test would time out rather than fail.
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn connect_to_closed_port_fails() {
+        let url = Url::parse("ws://127.0.0.1:1/").unwrap();
+        assert!(WebSocket::connect(url).await.is_err());
     }
 }

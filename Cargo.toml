@@ -122,6 +122,7 @@ web-sys = { version = "0.3", default-features = false, features = [
     "WebSocket",
     "BinaryType",
     "CloseEvent",
+    "Event",
     "MessageEvent",
 ] }
 js-sys = "0.3"
