@@ -110,7 +110,7 @@ async fn handle_client(fut: yawc::UpgradeFut) -> yawc::Result<()> {
 
     loop {
         let frame = ws.next().await.ok_or(WebSocketError::ConnectionClosed)?;
-        match frame.opcode {
+        match frame.opcode() {
             OpCode::Close => break,
             OpCode::Text | OpCode::Binary => {
                 ws.send(frame).await?;

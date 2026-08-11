@@ -11,8 +11,8 @@ use tokio::{
 };
 use url::Url;
 use yawc::{
-    frame::{FrameView, OpCode},
-    CompressionLevel, HttpRequest, HttpRequestBuilder, Options, WebSocket,
+    frame::{Frame, OpCode},
+    CompressionLevel, HttpRequest, HttpRequestBuilder, Options, TcpWebSocket, WebSocket,
 };
 
 /// Command to connect and interact with a WebSocket server.
@@ -69,7 +69,7 @@ async fn connect_with_tcp_host(
     tcp_host: &str,
     headers: &[String],
     timeout_duration: Duration,
-) -> anyhow::Result<WebSocket> {
+) -> anyhow::Result<TcpWebSocket> {
     // Resolve the TCP host to socket addresses
     let socket_addrs: Vec<SocketAddr> = lookup_host(tcp_host).await?.collect();
     if socket_addrs.is_empty() {
@@ -206,7 +206,7 @@ struct Opts {
 }
 
 async fn handle_websocket(
-    mut ws: WebSocket,
+    mut ws: TcpWebSocket,
     mut rx: UnboundedReceiver<String>,
     mut printer: impl ExternalPrinter,
     opts: Opts,
@@ -219,7 +219,7 @@ async fn handle_websocket(
                 }
 
                 let msg = msg.unwrap();
-                if let Err(err) = ws.send(FrameView::text(msg)).await {
+                if let Err(err) = ws.send(Frame::text(msg)).await {
                     let _ = printer.print(format!("unable to write: {}", err));
                 }
             }
@@ -230,9 +230,9 @@ async fn handle_websocket(
                 }
 
                 let frame = frame.unwrap();
-                match frame.opcode {
+                match frame.opcode() {
                     OpCode::Text => {
-                        let msg = std::str::from_utf8(&frame.payload).expect("utf8");
+                        let msg = std::str::from_utf8(frame.payload()).expect("utf8");
                         if opts.input_as_json {
                             match serde_json::from_str::<serde_json::Value>(msg) {
                                 Ok(ok) => {
@@ -250,7 +250,7 @@ async fn handle_websocket(
                         }
                     }
                     _ => {
-                        let _ = printer.print(format!("<{:?}>", frame.opcode));
+                        let _ = printer.print(format!("<{:?}>", frame.opcode()));
                     }
                 }
             }
