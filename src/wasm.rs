@@ -2,6 +2,7 @@ use futures::{
     channel::mpsc::{unbounded, UnboundedReceiver},
     stream::StreamExt,
 };
+use send_wrapper::SendWrapper;
 use std::{
     pin::Pin,
     str::FromStr,
@@ -33,7 +34,13 @@ pub struct WebSocket {
     /// Channel receiver for incoming messages and errors
     receiver: UnboundedReceiver<Result<Frame>>,
     /// Event handlers, kept alive for as long as the socket is and freed with it.
-    _handlers: [EventClosure; 4],
+    ///
+    /// `Closure` is never `Send`, which would make the whole socket `!Send` on targets
+    /// where it used to be `Send`. The wrapper restores that: the field is only ever
+    /// dropped, never read, so the cost is one thread-id comparison per socket. On an
+    /// `atomics` build the socket stays `!Send` anyway, because wasm-bindgen drops its
+    /// `Send` impl for `JsValue` there and `stream` inherits that.
+    _handlers: SendWrapper<[EventClosure; 4]>,
 }
 
 impl WebSocket {
@@ -142,7 +149,7 @@ impl WebSocket {
         let socket = Self {
             stream,
             receiver: rx,
-            _handlers: [onopen, onerror, onmessage, onclose],
+            _handlers: SendWrapper::new([onopen, onerror, onmessage, onclose]),
         };
 
         Ok((socket, outcome_rx))
